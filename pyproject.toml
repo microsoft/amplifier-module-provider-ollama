@@ -10,7 +10,6 @@ authors = [
 ]
 dependencies = [
     "ollama>=0.3.0",
-    "amplifier-core",
 ]
 
 [project.entry-points."amplifier.modules"]
@@ -24,10 +23,6 @@ build-backend = "hatchling.build"
 
 [tool.uv]
 package = true
-
-[tool.uv.sources.amplifier-core]
-path = "../amplifier-core"
-editable = true
 
 [tool.hatch.build.targets.wheel]
 packages = [
