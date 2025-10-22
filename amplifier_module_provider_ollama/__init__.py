@@ -5,6 +5,7 @@ Integrates with local Ollama server for LLM completions.
 
 import logging
 import os
+import time
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -12,6 +13,9 @@ from amplifier_core import ProviderResponse
 from amplifier_core import ToolCall
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ToolCallContent
+from amplifier_core.message_models import ChatRequest
+from amplifier_core.message_models import ChatResponse
+from amplifier_core.message_models import Message
 from ollama import AsyncClient
 from ollama import ResponseError
 
@@ -40,7 +44,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # Get configuration with defaults
     host = config.get("host", os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
 
-    provider = OllamaProvider(host, config)
+    provider = OllamaProvider(host, config, coordinator)
     await coordinator.mount("providers", provider, name="ollama")
 
     # Test connection but don't fail mount
@@ -62,24 +66,27 @@ class OllamaProvider:
 
     name = "ollama"
 
-    def __init__(self, host: str, config: dict[str, Any] | None = None):
+    def __init__(self, host: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None):
         """
         Initialize Ollama provider.
 
         Args:
             host: Ollama server URL
             config: Additional configuration
+            coordinator: Module coordinator for event emission
         """
         self.host = host
         self.client = AsyncClient(host=host)
         self.config = config or {}
+        self.coordinator = coordinator
 
         # Configuration with sensible defaults
         self.default_model = self.config.get("default_model", "llama3.2:3b")
         self.max_tokens = self.config.get("max_tokens", 4096)
         self.temperature = self.config.get("temperature", 0.7)
-        self.timeout = self.config.get("timeout", 120)
+        self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
         self.auto_pull = self.config.get("auto_pull", False)
+        self.debug = self.config.get("debug", False)
 
     async def _check_connection(self) -> bool:
         """Verify Ollama server is reachable."""
@@ -110,17 +117,20 @@ class OllamaProvider:
                     return False
             return False
 
-    async def complete(self, messages: list[dict[str, Any]], **kwargs) -> ProviderResponse:
+    async def complete(self, messages: list[dict[str, Any]] | ChatRequest, **kwargs) -> ProviderResponse | ChatResponse:
         """
         Generate completion from messages.
 
         Args:
-            messages: Conversation history
+            messages: Conversation history (list of dicts or ChatRequest)
             **kwargs: Additional parameters (model, temperature, max_tokens, tools, stream)
 
         Returns:
-            Provider response
+            Provider response or ChatResponse
         """
+        # Handle ChatRequest format
+        if isinstance(messages, ChatRequest):
+            return await self._complete_chat_request(messages, **kwargs)
         # Get parameters with fallbacks
         model = kwargs.get("model", self.default_model)
         temperature = kwargs.get("temperature", self.temperature)
@@ -149,6 +159,39 @@ class OllamaProvider:
         if tools:
             params["tools"] = self._format_tools_for_ollama(tools)
 
+        # Emit llm:request event if coordinator is available
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # INFO level: Summary only
+            await self.coordinator.hooks.emit(
+                "llm:request",
+                {
+                    "data": {
+                        "provider": "ollama",
+                        "model": model,
+                        "message_count": len(ollama_messages),
+                    }
+                },
+            )
+
+            # DEBUG level: Full request payload (if debug enabled)
+            if self.debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:debug",
+                    {
+                        "lvl": "DEBUG",
+                        "data": {
+                            "provider": "ollama",
+                            "request": {
+                                "model": model,
+                                "messages": ollama_messages,
+                                "max_tokens": max_tokens,
+                                "temperature": temperature,
+                            },
+                        },
+                    },
+                )
+
+        start_time = time.time()
         try:
             # Call Ollama API
             response = await self.client.chat(**params, stream=stream)
@@ -218,6 +261,45 @@ class OllamaProvider:
 
                     content_blocks.append(ToolCallContent(id=tc.id, name=tc.tool, arguments=input_dict))
 
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            # Emit llm:response event with success
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                # INFO level: Summary only
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "data": {
+                            "provider": "ollama",
+                            "model": model,
+                            "usage": usage,
+                        },
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+
+                # DEBUG level: Full response (if debug enabled)
+                if self.debug:
+                    content_preview = content[:500] + "..." if len(content) > 500 else content
+                    await self.coordinator.hooks.emit(
+                        "llm:response:debug",
+                        {
+                            "lvl": "DEBUG",
+                            "data": {
+                                "provider": "ollama",
+                                "response": {
+                                    "content_preview": content_preview,
+                                    "tool_calls": [{"tool": tc.tool, "id": tc.id} for tc in tool_calls]
+                                    if tool_calls
+                                    else [],
+                                },
+                            },
+                            "status": "ok",
+                            "duration_ms": elapsed_ms,
+                        },
+                    )
+
             return ProviderResponse(
                 content=content,
                 content_blocks=content_blocks,
@@ -227,12 +309,197 @@ class OllamaProvider:
             )
 
         except ResponseError as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            # Emit llm:response event with error
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "ollama",
+                        "model": model,
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": str(e),
+                    },
+                )
+
             if "connection" in str(e).lower():
                 raise ConnectionError(f"Cannot connect to Ollama at {self.host}. Is the server running?")
             logger.error(f"Ollama API error: {e}")
             raise
         except Exception as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            # Emit llm:response event with error
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "ollama",
+                        "model": model,
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": str(e),
+                    },
+                )
+
             logger.error(f"Ollama error: {e}")
+            raise
+
+    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
+        """Handle ChatRequest format with developer message conversion.
+
+        Args:
+            request: ChatRequest with messages
+            **kwargs: Additional parameters
+
+        Returns:
+            ChatResponse with content blocks
+        """
+        logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
+
+        # Separate messages by role
+        system_msgs = [m for m in request.messages if m.role == "system"]
+        developer_msgs = [m for m in request.messages if m.role == "developer"]
+        conversation = [m for m in request.messages if m.role in ("user", "assistant")]
+
+        # Ollama doesn't have a separate system parameter like Anthropic
+        # We'll prepend system messages as user messages
+        ollama_messages = []
+
+        # Add system messages as user messages (if any)
+        for sys_msg in system_msgs:
+            content = sys_msg.content if isinstance(sys_msg.content, str) else ""
+            ollama_messages.append({"role": "user", "content": content})
+
+        # Convert developer messages to XML-wrapped user messages
+        for dev_msg in developer_msgs:
+            content = dev_msg.content if isinstance(dev_msg.content, str) else ""
+            wrapped = f"<context_file>\n{content}\n</context_file>"
+            ollama_messages.append({"role": "user", "content": wrapped})
+
+        # Convert conversation messages
+        conversation_msgs = self._convert_messages([m.model_dump() for m in conversation])
+        ollama_messages.extend(conversation_msgs)
+
+        # Prepare request parameters
+        model = kwargs.get("model", self.default_model)
+        params = {
+            "model": model,
+            "messages": ollama_messages,
+            "options": {
+                "temperature": request.temperature or kwargs.get("temperature", self.temperature),
+                "num_predict": request.max_output_tokens or kwargs.get("max_tokens", self.max_tokens),
+            },
+        }
+
+        # Add tools if provided
+        if request.tools:
+            params["tools"] = self._format_tools_from_request(request.tools)
+
+        # Emit llm:request event
+        if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # INFO level: Summary only
+            await self.coordinator.hooks.emit(
+                "llm:request",
+                {
+                    "data": {
+                        "provider": "ollama",
+                        "model": model,
+                        "message_count": len(ollama_messages),
+                    }
+                },
+            )
+
+            # DEBUG level: Full request payload (if debug enabled)
+            if self.debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:debug",
+                    {
+                        "lvl": "DEBUG",
+                        "data": {
+                            "provider": "ollama",
+                            "request": {
+                                "model": model,
+                                "messages": ollama_messages,
+                                "options": params["options"],
+                            },
+                        },
+                    },
+                )
+
+        start_time = time.time()
+
+        # Call Ollama API
+        try:
+            response = await self.client.chat(**params)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            logger.info("[PROVIDER] Received response from Ollama API")
+
+            # Emit llm:response event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                # Build usage info
+                usage_info = {}
+                if "prompt_eval_count" in response:
+                    usage_info["input"] = response.get("prompt_eval_count", 0)
+                if "eval_count" in response:
+                    usage_info["output"] = response.get("eval_count", 0)
+
+                # INFO level: Summary only
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "data": {
+                            "provider": "ollama",
+                            "model": model,
+                            "usage": usage_info,
+                        },
+                        "status": "ok",
+                        "duration_ms": elapsed_ms,
+                    },
+                )
+
+                # DEBUG level: Full response (if debug enabled)
+                if self.debug:
+                    message = response.get("message", {})
+                    content = message.get("content", "")
+                    content_preview = content[:500] if content else ""
+                    await self.coordinator.hooks.emit(
+                        "llm:response:debug",
+                        {
+                            "lvl": "DEBUG",
+                            "data": {
+                                "provider": "ollama",
+                                "response": {
+                                    "content_preview": content_preview,
+                                },
+                            },
+                            "status": "ok",
+                            "duration_ms": elapsed_ms,
+                        },
+                    )
+
+            # Convert to ChatResponse
+            return self._convert_to_chat_response(response)
+
+        except Exception as e:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            logger.error(f"[PROVIDER] Ollama API error: {e}")
+
+            # Emit error event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "ollama",
+                        "model": model,
+                        "status": "error",
+                        "duration_ms": elapsed_ms,
+                        "error": str(e),
+                    },
+                )
             raise
 
     def parse_tool_calls(self, response: ProviderResponse) -> list[ToolCall]:
@@ -254,6 +521,7 @@ class OllamaProvider:
         Handles the conversion of:
         - Tool calls in assistant messages (Amplifier format -> OpenAI format)
         - Tool result messages
+        - Developer messages (converted to XML-wrapped user messages)
         - Regular user/assistant/system messages
         """
         ollama_messages = []
@@ -262,7 +530,12 @@ class OllamaProvider:
             role = msg.get("role")
             content = msg.get("content", "")
 
-            if role == "assistant":
+            if role == "developer":
+                # Developer messages -> XML-wrapped user messages (context files)
+                wrapped = f"<context_file>\n{content}\n</context_file>"
+                ollama_messages.append({"role": "user", "content": wrapped})
+
+            elif role == "assistant":
                 # Check for tool_calls in Amplifier format
                 if "tool_calls" in msg and msg["tool_calls"]:
                     # Convert Amplifier tool_calls to OpenAI format
@@ -313,3 +586,75 @@ class OllamaProvider:
             )
 
         return ollama_tools
+
+    def _format_tools_from_request(self, tools: list) -> list[dict[str, Any]]:
+        """Convert ToolSpec objects from ChatRequest to Ollama format.
+
+        Args:
+            tools: List of ToolSpec objects
+
+        Returns:
+            List of Ollama-formatted tool definitions
+        """
+        ollama_tools = []
+        for tool in tools:
+            ollama_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": tool.parameters,
+                    },
+                }
+            )
+        return ollama_tools
+
+    def _convert_to_chat_response(self, response: Any) -> ChatResponse:
+        """Convert Ollama response to ChatResponse format.
+
+        Args:
+            response: Ollama API response
+
+        Returns:
+            ChatResponse with content blocks
+        """
+        from amplifier_core.message_models import TextBlock
+        from amplifier_core.message_models import ToolCall
+        from amplifier_core.message_models import ToolCallBlock
+        from amplifier_core.message_models import Usage
+
+        content_blocks = []
+        tool_calls = []
+
+        message = response.get("message", {})
+        content = message.get("content", "")
+
+        # Add text content if present
+        if content:
+            content_blocks.append(TextBlock(text=content))
+
+        # Parse tool calls if present
+        if "tool_calls" in message:
+            for tc in message["tool_calls"]:
+                function = tc.get("function", {})
+                tool_id = tc.get("id", "")
+                tool_name = function.get("name", "")
+                tool_args = function.get("arguments", {})
+
+                content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_args))
+                tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_args))
+
+        # Build usage info
+        usage = Usage(
+            input_tokens=response.get("prompt_eval_count", 0),
+            output_tokens=response.get("eval_count", 0),
+            total_tokens=response.get("prompt_eval_count", 0) + response.get("eval_count", 0),
+        )
+
+        return ChatResponse(
+            content=content_blocks,
+            tool_calls=tool_calls if tool_calls else None,
+            usage=usage,
+            finish_reason=None,  # Ollama doesn't provide finish_reason
+        )
