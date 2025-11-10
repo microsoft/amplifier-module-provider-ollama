@@ -87,6 +87,7 @@ class OllamaProvider:
         self.timeout = self.config.get("timeout", 300.0)  # API timeout in seconds (default 5 minutes)
         self.auto_pull = self.config.get("auto_pull", False)
         self.debug = self.config.get("debug", False)
+        self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
 
     async def _check_connection(self) -> bool:
         """Verify Ollama server is reachable."""
@@ -191,10 +192,38 @@ class OllamaProvider:
                     },
                 )
 
+        # RAW DEBUG: Complete request params sent to Ollama API (ultra-verbose)
+        if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
+            await self.coordinator.hooks.emit(
+                "llm:request:raw",
+                {
+                    "lvl": "DEBUG",
+                    "data": {
+                        "provider": "ollama",
+                        "params": params,  # Complete params dict as-is
+                        "stream": stream,
+                    },
+                },
+            )
+
         start_time = time.time()
         try:
             # Call Ollama API
             response = await self.client.chat(**params, stream=stream)
+
+            # RAW DEBUG: Complete raw response from Ollama API (ultra-verbose)
+            # Note: For streaming responses, this captures the async iterator before consumption
+            if self.coordinator and hasattr(self.coordinator, "hooks") and self.debug and self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:response:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "data": {
+                            "provider": "ollama",
+                            "response": response if not stream else "<streaming_response>",  # Can't capture iterator
+                        },
+                    },
+                )
 
             # Parse response
             if stream:

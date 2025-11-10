@@ -18,9 +18,34 @@ Local LLM provider integration for Amplifier using Ollama.
     "default_model": "llama3.2:3b",    # Default model to use
     "max_tokens": 4096,                # Maximum tokens to generate
     "temperature": 0.7,                # Generation temperature
+    "debug": false,                    # Enable standard debug events
+    "raw_debug": false                 # Enable ultra-verbose raw API I/O logging
     "timeout": 120,                    # Request timeout in seconds
     "auto_pull": false                 # Automatically pull missing models
 }
+```
+
+### Debug Configuration
+
+**Standard Debug** (`debug: true`):
+- Emits `llm:request:debug` and `llm:response:debug` events
+- Contains request/response summaries with message counts, model info, usage stats
+- Moderate log volume, suitable for development
+
+**Raw Debug** (`debug: true, raw_debug: true`):
+- Emits `llm:request:raw` and `llm:response:raw` events
+- Contains complete, unmodified request params and response objects
+- Extreme log volume, use only for deep provider integration debugging
+- Captures the exact data sent to/from Ollama API before any processing
+
+**Example**:
+```yaml
+providers:
+  - module: provider-ollama
+    config:
+      debug: true      # Enable debug events
+      raw_debug: true  # Enable raw API I/O capture
+      default_model: llama3.2:3b
 ```
 
 ## Usage
