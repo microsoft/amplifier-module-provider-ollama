@@ -58,7 +58,6 @@ Use the provided installer script:
 
 ```bash
 # Install Ollama and pull default model
-cd /workspaces/amplifier/amplifier-dev
 ./scripts/install-ollama.sh --pull-model llama3.2:3b
 
 # Or install Ollama only
