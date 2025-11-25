@@ -8,7 +8,9 @@ import os
 import time
 from typing import Any
 
+from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
+from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
 from amplifier_core.content_models import ToolCallContent
 from amplifier_core.message_models import ChatRequest
@@ -87,6 +89,50 @@ class OllamaProvider:
         self.auto_pull = self.config.get("auto_pull", False)
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
+
+    def get_info(self) -> ProviderInfo:
+        """Get provider metadata."""
+        return ProviderInfo(
+            id="ollama",
+            display_name="Ollama",
+            credential_env_vars=[],  # No API key needed for local Ollama
+            capabilities=["streaming", "tools", "local"],
+            defaults={
+                "model": "llama3.2:3b",
+                "max_tokens": 4096,
+                "temperature": 0.7,
+                "timeout": 300.0,
+            },
+        )
+
+    async def list_models(self) -> list[ModelInfo]:
+        """
+        List available models from local Ollama server.
+
+        Queries the Ollama API to get list of installed models.
+        """
+        try:
+            response = await self.client.list()
+            models = []
+            for model in response.get("models", []):
+                model_name = model.get("name", "")
+                if model_name:
+                    # Extract details from model info
+                    details = model.get("details", {})
+                    models.append(
+                        ModelInfo(
+                            id=model_name,
+                            display_name=model_name,
+                            context_window=details.get("context_length", 4096),
+                            max_output_tokens=details.get("context_length", 4096),
+                            capabilities=["tools", "streaming", "local"],
+                            defaults={"temperature": 0.7, "max_tokens": 4096},
+                        )
+                    )
+            return models
+        except Exception as e:
+            logger.warning(f"Failed to list Ollama models: {e}")
+            return []
 
     async def _check_connection(self) -> bool:
         """Verify Ollama server is reachable."""
