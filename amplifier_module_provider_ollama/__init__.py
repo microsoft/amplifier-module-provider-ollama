@@ -3,6 +3,7 @@ Ollama provider module for Amplifier.
 Integrates with local Ollama server for LLM completions.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -321,9 +322,12 @@ class OllamaProvider:
 
         start_time = time.time()
 
-        # Call Ollama API
+        # Call Ollama API with timeout
         try:
-            response = await self.client.chat(**params)
+            response = await asyncio.wait_for(
+                self.client.chat(**params),
+                timeout=self.timeout,
+            )
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info("[PROVIDER] Received response from Ollama API")
@@ -369,6 +373,24 @@ class OllamaProvider:
 
             # Convert to ChatResponse
             return self._convert_to_chat_response(response)
+
+        except TimeoutError:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            logger.error(f"[PROVIDER] Ollama API call timed out after {self.timeout}s")
+
+            # Emit timeout event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "llm:response",
+                    {
+                        "provider": "ollama",
+                        "model": model,
+                        "status": "timeout",
+                        "duration_ms": elapsed_ms,
+                        "error": f"Request timed out after {self.timeout}s",
+                    },
+                )
+            raise TimeoutError(f"Ollama API call timed out after {self.timeout}s")
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
