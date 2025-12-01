@@ -292,6 +292,15 @@ class OllamaProvider:
         if request.tools:
             params["tools"] = self._format_tools_from_request(request.tools)
 
+        # Add structured output format if specified
+        if hasattr(request, "response_format") and request.response_format:
+            if isinstance(request.response_format, dict):
+                # JSON schema for structured output
+                params["format"] = request.response_format
+            elif request.response_format == "json":
+                # Simple JSON mode
+                params["format"] = "json"
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             # INFO level: Summary only
