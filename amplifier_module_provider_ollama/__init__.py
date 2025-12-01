@@ -259,14 +259,13 @@ class OllamaProvider:
         developer_msgs = [m for m in request.messages if m.role == "developer"]
         conversation = [m for m in request.messages if m.role in ("user", "assistant")]
 
-        # Ollama doesn't have a separate system parameter like Anthropic
-        # We'll prepend system messages as user messages
+        # Build ollama messages list
         ollama_messages = []
 
-        # Add system messages as user messages (if any)
+        # Add system messages with native role (Ollama supports role: system)
         for sys_msg in system_msgs:
             content = sys_msg.content if isinstance(sys_msg.content, str) else ""
-            ollama_messages.append({"role": "user", "content": content})
+            ollama_messages.append({"role": "system", "content": content})
 
         # Convert developer messages to XML-wrapped user messages
         for dev_msg in developer_msgs:
