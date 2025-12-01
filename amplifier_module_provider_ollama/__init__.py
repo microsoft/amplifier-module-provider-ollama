@@ -333,18 +333,20 @@ class OllamaProvider:
                 },
             )
 
-            # DEBUG level: Full request payload (if debug enabled)
+            # DEBUG level: Truncated request payload (if debug enabled)
             if self.debug:
                 await self.coordinator.hooks.emit(
                     "llm:request:debug",
                     {
                         "lvl": "DEBUG",
                         "provider": "ollama",
-                        "request": {
-                            "model": model,
-                            "messages": ollama_messages,
-                            "options": params["options"],
-                        },
+                        "request": _truncate_values(
+                            {
+                                "model": model,
+                                "messages": ollama_messages,
+                                "options": params.get("options", {}),
+                            }
+                        ),
                     },
                 )
 
@@ -381,19 +383,14 @@ class OllamaProvider:
                     },
                 )
 
-                # DEBUG level: Full response (if debug enabled)
+                # DEBUG level: Truncated response (if debug enabled)
                 if self.debug:
-                    message = response.get("message", {})
-                    content = message.get("content", "")
-                    content_preview = content[:500] if content else ""
                     await self.coordinator.hooks.emit(
                         "llm:response:debug",
                         {
                             "lvl": "DEBUG",
                             "provider": "ollama",
-                            "response": {
-                                "content_preview": content_preview,
-                            },
+                            "response": _truncate_values(response),
                             "status": "ok",
                             "duration_ms": elapsed_ms,
                         },
