@@ -254,10 +254,17 @@ class OllamaProvider:
         """
         logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
 
+        # Validate tool call sequences and repair if needed
+        missing_tool_ids = self._find_missing_tool_results(request.messages)
+        extra_tool_messages: list[dict[str, Any]] = []
+        for tool_id in missing_tool_ids:
+            logger.warning(f"Adding synthetic tool result for missing tool call: {tool_id}")
+            extra_tool_messages.append(self._create_synthetic_tool_result(tool_id))
+
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
         developer_msgs = [m for m in request.messages if m.role == "developer"]
-        conversation = [m for m in request.messages if m.role in ("user", "assistant")]
+        conversation = [m for m in request.messages if m.role in ("user", "assistant", "tool")]
 
         # Build ollama messages list
         ollama_messages = []
@@ -276,6 +283,9 @@ class OllamaProvider:
         # Convert conversation messages
         conversation_msgs = self._convert_messages([m.model_dump() for m in conversation])
         ollama_messages.extend(conversation_msgs)
+
+        # Append synthetic tool results for any missing tool calls
+        ollama_messages.extend(extra_tool_messages)
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
@@ -429,6 +439,58 @@ class OllamaProvider:
             List of tool calls
         """
         return response.tool_calls or []
+
+    def _find_missing_tool_results(self, messages: list[Message]) -> list[str]:
+        """Find tool calls without corresponding results.
+
+        Scans message history to detect tool calls that were never answered
+        with a tool result message.
+
+        Args:
+            messages: List of conversation messages
+
+        Returns:
+            List of tool call IDs that are missing results
+        """
+        pending_tool_ids: set[str] = set()
+
+        for msg in messages:
+            if msg.role == "assistant":
+                # Check for tool calls in content blocks
+                if hasattr(msg, "content") and isinstance(msg.content, list):
+                    for block in msg.content:
+                        if hasattr(block, "type") and block.type == "tool_use":
+                            pending_tool_ids.add(block.id)
+                        elif hasattr(block, "id") and hasattr(block, "name"):
+                            # ToolCallBlock style
+                            pending_tool_ids.add(block.id)
+                # Also check tool_calls field
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tc_id = tc.id if hasattr(tc, "id") else tc.get("id", "")
+                        if tc_id:
+                            pending_tool_ids.add(tc_id)
+            elif msg.role == "tool":
+                # Tool result - remove from pending
+                tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else ""
+                pending_tool_ids.discard(tool_call_id)
+
+        return list(pending_tool_ids)
+
+    def _create_synthetic_tool_result(self, tool_use_id: str) -> dict[str, Any]:
+        """Create placeholder result for missing tool call.
+
+        Args:
+            tool_use_id: The ID of the tool call that needs a result
+
+        Returns:
+            Dict in tool message format with error content
+        """
+        return {
+            "role": "tool",
+            "tool_call_id": tool_use_id,
+            "content": "Tool execution was interrupted or result was lost",
+        }
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
