@@ -18,6 +18,7 @@ from amplifier_core.content_models import ToolCallContent
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
+from amplifier_core.message_models import ThinkingBlock
 from amplifier_core.message_models import ToolCall
 
 from ollama import AsyncClient
@@ -229,7 +230,7 @@ class OllamaProvider:
                     return False
             return False
 
-    async def complete(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    async def complete(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
         """
         Generate completion from ChatRequest.
 
@@ -238,11 +239,11 @@ class OllamaProvider:
             **kwargs: Provider-specific options (override request fields)
 
         Returns:
-            ChatResponse with content blocks, tool calls, usage
+            OllamaChatResponse with content blocks, tool calls, usage, and optional thinking
         """
         return await self._complete_chat_request(request, **kwargs)
 
-    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> ChatResponse:
+    async def _complete_chat_request(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
         """Handle ChatRequest format with developer message conversion.
 
         Args:
@@ -250,7 +251,7 @@ class OllamaProvider:
             **kwargs: Additional parameters
 
         Returns:
-            ChatResponse with content blocks
+            OllamaChatResponse with content blocks
         """
         logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
 
@@ -310,6 +311,12 @@ class OllamaProvider:
             elif request.response_format == "json":
                 # Simple JSON mode
                 params["format"] = "json"
+
+        # Enable thinking/reasoning if requested (for compatible models like DeepSeek R1, Qwen 3)
+        include_thinking = False
+        if hasattr(request, "enable_thinking") and request.enable_thinking:
+            params["options"]["think"] = True
+            include_thinking = True
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -389,8 +396,8 @@ class OllamaProvider:
                         },
                     )
 
-            # Convert to ChatResponse
-            return self._convert_to_chat_response(response)
+            # Convert to OllamaChatResponse
+            return self._convert_to_chat_response(response, include_thinking=include_thinking)
 
         except TimeoutError:
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -588,14 +595,15 @@ class OllamaProvider:
             )
         return ollama_tools
 
-    def _convert_to_chat_response(self, response: Any) -> ChatResponse:
-        """Convert Ollama response to ChatResponse format.
+    def _convert_to_chat_response(self, response: Any, include_thinking: bool = False) -> OllamaChatResponse:
+        """Convert Ollama response to OllamaChatResponse format.
 
         Args:
             response: Ollama API response
+            include_thinking: Whether to include thinking content in response
 
         Returns:
-            ChatResponse with content blocks
+            OllamaChatResponse with content blocks and optional thinking
         """
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import ToolCall
@@ -604,9 +612,21 @@ class OllamaProvider:
 
         content_blocks = []
         tool_calls = []
+        thinking_content = None
 
         message = response.get("message", {})
         content = message.get("content", "")
+        thinking = message.get("thinking", "")
+
+        # Add thinking block if present and requested
+        if thinking and include_thinking:
+            thinking_content = thinking
+            content_blocks.append(
+                ThinkingBlock(
+                    thinking=thinking,
+                    signature=None,  # Ollama doesn't provide signatures
+                )
+            )
 
         # Add text content if present
         if content:
@@ -630,9 +650,12 @@ class OllamaProvider:
             total_tokens=response.get("prompt_eval_count", 0) + response.get("eval_count", 0),
         )
 
-        return ChatResponse(
+        return OllamaChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
             usage=usage,
             finish_reason=None,  # Ollama doesn't provide finish_reason
+            raw_response=response if self.raw_debug else None,
+            model_name=response.get("model"),
+            thinking_content=thinking_content,
         )
