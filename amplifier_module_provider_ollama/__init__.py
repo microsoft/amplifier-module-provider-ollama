@@ -14,6 +14,7 @@ from amplifier_core import ModelInfo
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ProviderInfo
 from amplifier_core.content_models import TextContent
+from amplifier_core.content_models import ThinkingContent
 from amplifier_core.content_models import ToolCallContent
 from amplifier_core.message_models import ChatRequest
 from amplifier_core.message_models import ChatResponse
@@ -21,8 +22,8 @@ from amplifier_core.message_models import Message
 from amplifier_core.message_models import ThinkingBlock
 from amplifier_core.message_models import ToolCall
 
-from ollama import AsyncClient
-from ollama import ResponseError
+from ollama import AsyncClient  # pyright: ignore[reportAttributeAccessIssue]
+from ollama import ResponseError  # pyright: ignore[reportAttributeAccessIssue]
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ class OllamaChatResponse(ChatResponse):
     raw_response: dict[str, Any] | None = None
     model_name: str | None = None
     thinking_content: str | None = None
+    # content_blocks for streaming UI compatibility (triggers content_block:start/end events)
+    content_blocks: list[TextContent | ThinkingContent | ToolCallContent] | None = None
+    text: str | None = None
 
 
 def _truncate_values(
@@ -135,6 +139,13 @@ class OllamaProvider:
         self.auto_pull = self.config.get("auto_pull", False)
         self.debug = self.config.get("debug", False)
         self.raw_debug = self.config.get("raw_debug", False)  # Enable ultra-verbose raw API I/O logging
+        # Context window size (num_ctx in ollama) - 0 means auto-detect from model
+        self.num_ctx = self.config.get("num_ctx", 0)
+        # Cache for model context lengths (avoid repeated API calls)
+        self._model_ctx_cache: dict[str, int] = {}
+        # Enable thinking/reasoning for models that support it (default: True)
+        # Models that don't support thinking will simply ignore this option
+        self.enable_thinking = self.config.get("enable_thinking", True)
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -230,6 +241,47 @@ class OllamaProvider:
                     return False
             return False
 
+    async def _get_model_context_length(self, model: str) -> int:
+        """Get context length for a model, with caching.
+
+        Queries the ollama API to get the model's context_length from model_info.
+        Falls back to 8192 if unable to determine.
+
+        Args:
+            model: Model name to query
+
+        Returns:
+            Context length in tokens
+        """
+        # Check cache first
+        if model in self._model_ctx_cache:
+            return self._model_ctx_cache[model]
+
+        try:
+            # Query model info from ollama
+            info = await self.client.show(model)
+            # modelinfo (no underscore) contains context_length (e.g., "gptoss.context_length": 131072)
+            model_info = getattr(info, "modelinfo", None) or getattr(info, "model_info", None) or {}
+
+            # Look for context_length in various formats
+            ctx_length = None
+            for key, value in model_info.items():
+                if "context_length" in key.lower():
+                    ctx_length = value
+                    break
+
+            if ctx_length and isinstance(ctx_length, int) and ctx_length > 0:
+                self._model_ctx_cache[model] = ctx_length
+                logger.debug(f"Model {model} context_length: {ctx_length}")
+                return ctx_length
+        except Exception as e:
+            logger.debug(f"Could not get context_length for {model}: {e}")
+
+        # Default fallback
+        default_ctx = 8192
+        self._model_ctx_cache[model] = default_ctx
+        return default_ctx
+
     async def complete(self, request: ChatRequest, **kwargs) -> OllamaChatResponse:
         """
         Generate completion from ChatRequest.
@@ -302,6 +354,15 @@ class OllamaProvider:
             },
         }
 
+        # Set context window size (num_ctx controls how much context ollama uses)
+        # If num_ctx is configured, use it; otherwise auto-detect from model
+        if self.num_ctx > 0:
+            params["options"]["num_ctx"] = self.num_ctx
+        else:
+            # Auto-detect context length from model info
+            ctx_length = await self._get_model_context_length(model)
+            params["options"]["num_ctx"] = ctx_length
+
         # Add tools if provided
         if request.tools:
             params["tools"] = self._format_tools_from_request(request.tools)
@@ -315,9 +376,14 @@ class OllamaProvider:
                 # Simple JSON mode
                 params["format"] = "json"
 
-        # Enable thinking/reasoning if requested (for compatible models like DeepSeek R1, Qwen 3)
+        # Enable thinking/reasoning if requested or if provider config enables it
+        # Models that don't support thinking will simply ignore the think option
         include_thinking = False
         if hasattr(request, "enable_thinking") and request.enable_thinking:
+            params["options"]["think"] = True
+            include_thinking = True
+        elif self.enable_thinking:
+            # Provider config enables thinking by default
             params["options"]["think"] = True
             include_thinking = True
 
@@ -350,14 +416,27 @@ class OllamaProvider:
                     },
                 )
 
+            # RAW level: Full request payload (if raw_debug enabled)
+            if self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "ollama",
+                        "request": params,
+                    },
+                )
+
         start_time = time.time()
 
         # Call Ollama API with timeout
         try:
-            response = await asyncio.wait_for(
+            raw_response = await asyncio.wait_for(
                 self.client.chat(**params),
                 timeout=self.timeout,
             )
+            # Convert Pydantic model to dict for consistent access
+            response = raw_response.model_dump() if hasattr(raw_response, "model_dump") else dict(raw_response)
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             logger.info("[PROVIDER] Received response from Ollama API")
@@ -391,6 +470,19 @@ class OllamaProvider:
                             "lvl": "DEBUG",
                             "provider": "ollama",
                             "response": _truncate_values(response),
+                            "status": "ok",
+                            "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Full response (if raw_debug enabled)
+                if self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "ollama",
+                            "response": response,
                             "status": "ok",
                             "duration_ms": elapsed_ms,
                         },
@@ -490,6 +582,15 @@ class OllamaProvider:
             "stream": True,
         }
 
+        # Set context window size (num_ctx controls how much context ollama uses)
+        # If num_ctx is configured, use it; otherwise auto-detect from model
+        if self.num_ctx > 0:
+            params["options"]["num_ctx"] = self.num_ctx
+        else:
+            # Auto-detect context length from model info
+            ctx_length = await self._get_model_context_length(model)
+            params["options"]["num_ctx"] = ctx_length
+
         # Add tools if provided (note: tool calls may not work well with streaming)
         if request.tools:
             params["tools"] = self._format_tools_from_request(request.tools)
@@ -501,14 +602,20 @@ class OllamaProvider:
             elif request.response_format == "json":
                 params["format"] = "json"
 
-        # Enable thinking if requested
+        # Enable thinking/reasoning if requested or if provider config enables it
+        # Models that don't support thinking will simply ignore the think option
         include_thinking = False
         if hasattr(request, "enable_thinking") and request.enable_thinking:
+            params["options"]["think"] = True
+            include_thinking = True
+        elif self.enable_thinking:
+            # Provider config enables thinking by default
             params["options"]["think"] = True
             include_thinking = True
 
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
+            # INFO level: Summary only
             await self.coordinator.hooks.emit(
                 "llm:request",
                 {
@@ -518,6 +625,36 @@ class OllamaProvider:
                     "stream": True,
                 },
             )
+
+            # DEBUG level: Truncated request payload (if debug enabled)
+            if self.debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:debug",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "ollama",
+                        "stream": True,
+                        "request": _truncate_values(
+                            {
+                                "model": model,
+                                "messages": ollama_messages,
+                                "options": params.get("options", {}),
+                            }
+                        ),
+                    },
+                )
+
+            # RAW level: Full request payload (if raw_debug enabled)
+            if self.raw_debug:
+                await self.coordinator.hooks.emit(
+                    "llm:request:raw",
+                    {
+                        "lvl": "DEBUG",
+                        "provider": "ollama",
+                        "stream": True,
+                        "request": params,
+                    },
+                )
 
         start_time = time.time()
         accumulated_content = ""
@@ -575,6 +712,44 @@ class OllamaProvider:
                         "stream": True,
                     },
                 )
+
+                # DEBUG level: Truncated response (if debug enabled)
+                if self.debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:debug",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "ollama",
+                            "stream": True,
+                            "response": _truncate_values(
+                                {
+                                    "content": accumulated_content,
+                                    "thinking": accumulated_thinking if accumulated_thinking else None,
+                                    "final_chunk": final_chunk,
+                                }
+                            ),
+                            "status": "ok",
+                            "duration_ms": elapsed_ms,
+                        },
+                    )
+
+                # RAW level: Full response (if raw_debug enabled)
+                if self.raw_debug:
+                    await self.coordinator.hooks.emit(
+                        "llm:response:raw",
+                        {
+                            "lvl": "DEBUG",
+                            "provider": "ollama",
+                            "stream": True,
+                            "response": {
+                                "content": accumulated_content,
+                                "thinking": accumulated_thinking if accumulated_thinking else None,
+                                "final_chunk": final_chunk,
+                            },
+                            "status": "ok",
+                            "duration_ms": elapsed_ms,
+                        },
+                    )
 
             # Build final response
             return self._build_streaming_response(
@@ -640,11 +815,12 @@ class OllamaProvider:
         from amplifier_core.message_models import TextBlock
         from amplifier_core.message_models import Usage
 
-        content_blocks = []
+        content_blocks = []  # For context storage (message_models: ThinkingBlock, TextBlock, etc.)
+        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []  # For streaming UI events
         thinking_content = None
 
-        # Add thinking block if present and requested
-        if thinking and include_thinking:
+        # Add thinking block if present (always include when model returns it)
+        if thinking:
             thinking_content = thinking
             content_blocks.append(
                 ThinkingBlock(
@@ -652,10 +828,14 @@ class OllamaProvider:
                     signature=None,
                 )
             )
+            # Also add to event_blocks for streaming UI hooks
+            event_blocks.append(ThinkingContent(text=thinking))
 
         # Add text content
         if content:
             content_blocks.append(TextBlock(text=content))
+            # Also add to event_blocks for streaming UI hooks
+            event_blocks.append(TextContent(text=content))
 
         # Extract usage from final chunk
         usage = Usage(
@@ -674,6 +854,8 @@ class OllamaProvider:
             raw_response=final_chunk if self.raw_debug else None,
             model_name=final_chunk.get("model") if final_chunk else None,
             thinking_content=thinking_content,
+            content_blocks=event_blocks if event_blocks else None,  # For streaming UI events
+            text=content or None,
         )
 
     def parse_tool_calls(self, response: ChatResponse) -> list[ToolCall]:
@@ -749,12 +931,27 @@ class OllamaProvider:
         - Tool result messages
         - Developer messages (converted to XML-wrapped user messages)
         - Regular user/assistant/system messages
+        - Structured content blocks (list of text/image blocks) -> plain string
         """
         ollama_messages = []
 
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content", "")
+
+            # Handle structured content (list of content blocks from Amplifier)
+            # Convert to plain string for Ollama which expects string content
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        # TextContent block: {"type": "text", "text": "..."}
+                        if block.get("type") == "text" and "text" in block:
+                            text_parts.append(block["text"])
+                        # ToolCallContent or other blocks - skip for now
+                    elif isinstance(block, str):
+                        text_parts.append(block)
+                content = "\n".join(text_parts) if text_parts else ""
 
             if role == "developer":
                 # Developer messages -> XML-wrapped user messages (context files)
@@ -851,16 +1048,18 @@ class OllamaProvider:
         from amplifier_core.message_models import ToolCallBlock
         from amplifier_core.message_models import Usage
 
-        content_blocks = []
+        content_blocks = []  # For context storage (message_models: ThinkingBlock, TextBlock, etc.)
+        event_blocks: list[TextContent | ThinkingContent | ToolCallContent] = []  # For streaming UI events
         tool_calls = []
         thinking_content = None
+        text_accumulator: list[str] = []
 
         message = response.get("message", {})
         content = message.get("content", "")
         thinking = message.get("thinking", "")
 
-        # Add thinking block if present and requested
-        if thinking and include_thinking:
+        # Add thinking block if present (always include when model returns it)
+        if thinking:
             thinking_content = thinking
             content_blocks.append(
                 ThinkingBlock(
@@ -868,13 +1067,18 @@ class OllamaProvider:
                     signature=None,  # Ollama doesn't provide signatures
                 )
             )
+            # Also add to event_blocks for streaming UI hooks
+            event_blocks.append(ThinkingContent(text=thinking))
 
         # Add text content if present
         if content:
             content_blocks.append(TextBlock(text=content))
+            text_accumulator.append(content)
+            # Also add to event_blocks for streaming UI hooks
+            event_blocks.append(TextContent(text=content))
 
-        # Parse tool calls if present
-        if "tool_calls" in message:
+        # Parse tool calls if present (check both key exists and value is not None)
+        if message.get("tool_calls"):
             for tc in message["tool_calls"]:
                 function = tc.get("function", {})
                 tool_id = tc.get("id", "")
@@ -883,6 +1087,8 @@ class OllamaProvider:
 
                 content_blocks.append(ToolCallBlock(id=tool_id, name=tool_name, input=tool_args))
                 tool_calls.append(ToolCall(id=tool_id, name=tool_name, arguments=tool_args))
+                # Also add to event_blocks for streaming UI hooks
+                event_blocks.append(ToolCallContent(id=tool_id, name=tool_name, arguments=tool_args))
 
         # Build usage info
         usage = Usage(
@@ -890,6 +1096,8 @@ class OllamaProvider:
             output_tokens=response.get("eval_count", 0),
             total_tokens=response.get("prompt_eval_count", 0) + response.get("eval_count", 0),
         )
+
+        combined_text = "\n\n".join(text_accumulator).strip()
 
         return OllamaChatResponse(
             content=content_blocks,
@@ -899,4 +1107,6 @@ class OllamaProvider:
             raw_response=response if self.raw_debug else None,
             model_name=response.get("model"),
             thinking_content=thinking_content,
+            content_blocks=event_blocks if event_blocks else None,  # For streaming UI events
+            text=combined_text or None,
         )
