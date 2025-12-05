@@ -21,7 +21,6 @@ from amplifier_core.message_models import ChatResponse
 from amplifier_core.message_models import Message
 from amplifier_core.message_models import ThinkingBlock
 from amplifier_core.message_models import ToolCall
-
 from ollama import AsyncClient  # pyright: ignore[reportAttributeAccessIssue]
 from ollama import ResponseError  # pyright: ignore[reportAttributeAccessIssue]
 
@@ -379,7 +378,7 @@ class OllamaProvider:
         # Enable thinking/reasoning if requested or if provider config enables it
         # Models that don't support thinking will simply ignore the think option
         include_thinking = False
-        if hasattr(request, "enable_thinking") and request.enable_thinking:
+        if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
             params["options"]["think"] = True
             include_thinking = True
         elif self.enable_thinking:
@@ -605,7 +604,7 @@ class OllamaProvider:
         # Enable thinking/reasoning if requested or if provider config enables it
         # Models that don't support thinking will simply ignore the think option
         include_thinking = False
-        if hasattr(request, "enable_thinking") and request.enable_thinking:
+        if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
             params["options"]["think"] = True
             include_thinking = True
         elif self.enable_thinking:
@@ -890,20 +889,21 @@ class OllamaProvider:
                 if hasattr(msg, "content") and isinstance(msg.content, list):
                     for block in msg.content:
                         if hasattr(block, "type") and block.type == "tool_use":
-                            pending_tool_ids.add(block.id)
+                            pending_tool_ids.add(block.id)  # pyright: ignore[reportAttributeAccessIssue]
                         elif hasattr(block, "id") and hasattr(block, "name"):
                             # ToolCallBlock style
-                            pending_tool_ids.add(block.id)
+                            pending_tool_ids.add(block.id)  # pyright: ignore[reportAttributeAccessIssue]
                 # Also check tool_calls field
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for tc in msg.tool_calls:
+                if hasattr(msg, "tool_calls") and msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
+                    for tc in msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
                         tc_id = tc.id if hasattr(tc, "id") else tc.get("id", "")
                         if tc_id:
                             pending_tool_ids.add(tc_id)
             elif msg.role == "tool":
                 # Tool result - remove from pending
                 tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else ""
-                pending_tool_ids.discard(tool_call_id)
+                if tool_call_id:
+                    pending_tool_ids.discard(tool_call_id)
 
         return list(pending_tool_ids)
 
