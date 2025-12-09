@@ -3,6 +3,9 @@ Ollama provider module for Amplifier.
 Integrates with local Ollama server for LLM completions.
 """
 
+# Amplifier module metadata
+__amplifier_module_type__ = "provider"
+
 import asyncio
 import logging
 import os
