@@ -161,6 +161,8 @@ class OllamaProvider:
                 "max_tokens": 4096,
                 "temperature": 0.7,
                 "timeout": 300.0,
+                "context_window": 128000,
+                "max_output_tokens": 64000,
             },
             config_fields=[
                 ConfigField(
