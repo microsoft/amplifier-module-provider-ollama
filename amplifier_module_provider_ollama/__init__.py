@@ -149,6 +149,12 @@ class OllamaProvider:
         # Models that don't support thinking will simply ignore this option
         self.enable_thinking = self.config.get("enable_thinking", True)
 
+        # Track tool call IDs that have been repaired with synthetic results.
+        # This prevents infinite loops when the same missing tool results are
+        # detected repeatedly across LLM iterations (since synthetic results
+        # are injected into request.messages but not persisted to message store).
+        self._repaired_tool_ids: set[str] = set()
+
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
@@ -315,11 +321,34 @@ class OllamaProvider:
         logger.info(f"[PROVIDER] Received ChatRequest with {len(request.messages)} messages")
 
         # Validate tool call sequences and repair if needed
-        missing_tool_ids = self._find_missing_tool_results(request.messages)
+        missing = self._find_missing_tool_results(request.messages)
         extra_tool_messages: list[dict[str, Any]] = []
-        for tool_id in missing_tool_ids:
-            logger.warning(f"Adding synthetic tool result for missing tool call: {tool_id}")
-            extra_tool_messages.append(self._create_synthetic_tool_result(tool_id))
+
+        if missing:
+            logger.warning(
+                f"[PROVIDER] Ollama: Detected {len(missing)} missing tool result(s). "
+                f"Injecting synthetic errors. This indicates a bug in context management. "
+                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+            )
+
+            # Inject synthetic results and track repaired IDs to prevent infinite loops
+            for call_id, tool_name, _ in missing:
+                extra_tool_messages.append(self._create_synthetic_result(call_id, tool_name))
+                # Track this ID so we don't detect it as missing again in future iterations
+                self._repaired_tool_ids.add(call_id)
+
+            # Emit observability event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:tool_sequence_repaired",
+                    {
+                        "provider": self.name,
+                        "repair_count": len(missing),
+                        "repairs": [
+                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                        ],
+                    },
+                )
 
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
@@ -547,11 +576,34 @@ class OllamaProvider:
         logger.info(f"[PROVIDER] Streaming request with {len(request.messages)} messages")
 
         # Validate tool call sequences (same as non-streaming)
-        missing_tool_ids = self._find_missing_tool_results(request.messages)
+        missing = self._find_missing_tool_results(request.messages)
         extra_tool_messages: list[dict[str, Any]] = []
-        for tool_id in missing_tool_ids:
-            logger.warning(f"Adding synthetic tool result for missing tool call: {tool_id}")
-            extra_tool_messages.append(self._create_synthetic_tool_result(tool_id))
+
+        if missing:
+            logger.warning(
+                f"[PROVIDER] Ollama: Detected {len(missing)} missing tool result(s). "
+                f"Injecting synthetic errors. This indicates a bug in context management. "
+                f"Tool IDs: {[call_id for call_id, _, _ in missing]}"
+            )
+
+            # Inject synthetic results and track repaired IDs to prevent infinite loops
+            for call_id, tool_name, _ in missing:
+                extra_tool_messages.append(self._create_synthetic_result(call_id, tool_name))
+                # Track this ID so we don't detect it as missing again in future iterations
+                self._repaired_tool_ids.add(call_id)
+
+            # Emit observability event
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:tool_sequence_repaired",
+                    {
+                        "provider": self.name,
+                        "repair_count": len(missing),
+                        "repairs": [
+                            {"tool_call_id": call_id, "tool_name": tool_name} for call_id, tool_name, _ in missing
+                        ],
+                    },
+                )
 
         # Separate messages by role
         system_msgs = [m for m in request.messages if m.role == "system"]
@@ -874,19 +926,23 @@ class OllamaProvider:
         """
         return response.tool_calls or []
 
-    def _find_missing_tool_results(self, messages: list[Message]) -> list[str]:
+    def _find_missing_tool_results(self, messages: list[Message]) -> list[tuple[str, str, dict]]:
         """Find tool calls without corresponding results.
 
         Scans message history to detect tool calls that were never answered
         with a tool result message.
 
+        Filters out tool call IDs that have already been repaired with synthetic
+        results to prevent infinite detection loops across LLM iterations.
+
         Args:
             messages: List of conversation messages
 
         Returns:
-            List of tool call IDs that are missing results
+            List of (call_id, tool_name, tool_arguments) tuples for unpaired calls
         """
-        pending_tool_ids: set[str] = set()
+        tool_calls: dict[str, tuple[str, dict]] = {}  # {call_id: (name, args)}
+        tool_results: set[str] = set()  # {call_id}
 
         for msg in messages:
             if msg.role == "assistant":
@@ -894,37 +950,65 @@ class OllamaProvider:
                 if hasattr(msg, "content") and isinstance(msg.content, list):
                     for block in msg.content:
                         if hasattr(block, "type") and block.type == "tool_use":
-                            pending_tool_ids.add(block.id)  # pyright: ignore[reportAttributeAccessIssue]
+                            block_id = getattr(block, "id", "")
+                            block_name = getattr(block, "name", "unknown")
+                            block_input = getattr(block, "input", {})
+                            if block_id:
+                                tool_calls[block_id] = (block_name, block_input)
                         elif hasattr(block, "id") and hasattr(block, "name"):
                             # ToolCallBlock style
-                            pending_tool_ids.add(block.id)  # pyright: ignore[reportAttributeAccessIssue]
+                            block_id = getattr(block, "id", "")
+                            block_name = getattr(block, "name", "unknown")
+                            block_input = getattr(block, "input", {})
+                            if block_id:
+                                tool_calls[block_id] = (block_name, block_input)
                 # Also check tool_calls field
                 if hasattr(msg, "tool_calls") and msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
                     for tc in msg.tool_calls:  # pyright: ignore[reportAttributeAccessIssue]
                         tc_id = tc.id if hasattr(tc, "id") else tc.get("id", "")
+                        tc_name = tc.name if hasattr(tc, "name") else tc.get("name", "unknown")
+                        tc_args = tc.arguments if hasattr(tc, "arguments") else tc.get("arguments", {})
                         if tc_id:
-                            pending_tool_ids.add(tc_id)
+                            tool_calls[tc_id] = (tc_name, tc_args)
             elif msg.role == "tool":
-                # Tool result - remove from pending
+                # Tool result - mark as received
                 tool_call_id = msg.tool_call_id if hasattr(msg, "tool_call_id") else ""
                 if tool_call_id:
-                    pending_tool_ids.discard(tool_call_id)
+                    tool_results.add(tool_call_id)
 
-        return list(pending_tool_ids)
+        # Exclude IDs that have already been repaired to prevent infinite loops
+        return [
+            (call_id, name, args)
+            for call_id, (name, args) in tool_calls.items()
+            if call_id not in tool_results and call_id not in self._repaired_tool_ids
+        ]
 
-    def _create_synthetic_tool_result(self, tool_use_id: str) -> dict[str, Any]:
-        """Create placeholder result for missing tool call.
+    def _create_synthetic_result(self, call_id: str, tool_name: str) -> dict[str, Any]:
+        """Create synthetic error result for missing tool response.
+
+        This is a BACKUP for when tool results go missing AFTER execution.
+        The orchestrator should handle tool execution errors at runtime,
+        so this should only trigger on context/parsing bugs.
 
         Args:
-            tool_use_id: The ID of the tool call that needs a result
+            call_id: The ID of the tool call that needs a result
+            tool_name: The name of the tool that was called
 
         Returns:
             Dict in tool message format with error content
         """
         return {
             "role": "tool",
-            "tool_call_id": tool_use_id,
-            "content": "Tool execution was interrupted or result was lost",
+            "tool_call_id": call_id,
+            "content": (
+                f"[SYSTEM ERROR: Tool result missing from conversation history]\n\n"
+                f"Tool: {tool_name}\n"
+                f"Call ID: {call_id}\n\n"
+                f"This indicates the tool result was lost after execution.\n"
+                f"Likely causes: context compaction bug, message parsing error, or state corruption.\n\n"
+                f"The tool may have executed successfully, but the result was lost.\n"
+                f"Please acknowledge this error and offer to retry the operation."
+            ),
         }
 
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
