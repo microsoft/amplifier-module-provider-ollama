@@ -120,17 +120,20 @@ class OllamaProvider:
     name = "ollama"
     api_label = "Ollama"
 
-    def __init__(self, host: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None):
+    def __init__(self, host: str | None = None, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None):
         """
         Initialize Ollama provider.
 
+        The SDK client is created lazily on first use, allowing get_info()
+        to work without a running Ollama server.
+
         Args:
-            host: Ollama server URL
+            host: Ollama server URL (can be None for get_info() calls)
             config: Additional configuration
             coordinator: Module coordinator for event emission
         """
         self.host = host
-        self.client = AsyncClient(host=host)
+        self._client: AsyncClient | None = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
 
@@ -155,6 +158,15 @@ class OllamaProvider:
         # detected repeatedly across LLM iterations (since synthetic results
         # are injected into request.messages but not persisted to message store).
         self._repaired_tool_ids: set[str] = set()
+
+    @property
+    def client(self) -> AsyncClient:
+        """Lazily initialize the Ollama client on first access."""
+        if self._client is None:
+            if self.host is None:
+                raise ValueError("host must be provided for API calls")
+            self._client = AsyncClient(host=self.host)
+        return self._client
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
