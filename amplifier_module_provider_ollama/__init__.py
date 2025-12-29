@@ -118,6 +118,7 @@ class OllamaProvider:
     """Ollama local LLM integration."""
 
     name = "ollama"
+    api_label = "Ollama"
 
     def __init__(self, host: str, config: dict[str, Any] | None = None, coordinator: ModuleCoordinator | None = None):
         """
