@@ -209,31 +209,29 @@ class OllamaProvider:
         List available models from local Ollama server.
 
         Queries the Ollama API to get list of installed models.
+        Raises exception if server is unreachable (no fallback - caller handles errors).
         """
-        try:
-            response = await self.client.list()
-            models = []
-            # response.models is a list of Model objects with .model attribute (not .name)
-            for model in response.models:
-                model_name = model.model  # Model objects use .model, not .name
-                if model_name:
-                    # Extract details - model.details is a ModelDetails object
-                    details = model.details
-                    context_length = getattr(details, "context_length", None) or 4096
-                    models.append(
-                        ModelInfo(
-                            id=model_name,
-                            display_name=model_name,
-                            context_window=context_length,
-                            max_output_tokens=context_length,
-                            capabilities=["tools", "streaming", "local"],
-                            defaults={"temperature": 0.7, "max_tokens": 4096},
-                        )
+        # Let exceptions propagate - connection errors should be shown to user
+        response = await self.client.list()
+        models = []
+        # response.models is a list of Model objects with .model attribute (not .name)
+        for model in response.models:
+            model_name = model.model  # Model objects use .model, not .name
+            if model_name:
+                # Extract details - model.details is a ModelDetails object
+                details = model.details
+                context_length = getattr(details, "context_length", None) or 4096
+                models.append(
+                    ModelInfo(
+                        id=model_name,
+                        display_name=model_name,
+                        context_window=context_length,
+                        max_output_tokens=context_length,
+                        capabilities=["tools", "streaming", "local"],
+                        defaults={"temperature": 0.7, "max_tokens": 4096},
                     )
-            return models
-        except Exception as e:
-            logger.warning(f"Failed to list Ollama models: {e}")
-            return []
+                )
+        return models
 
     async def _check_connection(self) -> bool:
         """Verify Ollama server is reachable."""
