@@ -455,6 +455,9 @@ class OllamaProvider:
                             "temperature": 0.7,
                             "max_tokens": DEFAULT_CONTEXT_LENGTH,
                         },
+                        cost_per_input_token=0.0,
+                        cost_per_output_token=0.0,
+                        metadata={"cost_tier": "free"},
                     )
                 )
         return models
