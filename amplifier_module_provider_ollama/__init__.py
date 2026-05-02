@@ -732,19 +732,25 @@ class OllamaProvider:
 
             logger.info("[PROVIDER] Received response from Ollama API")
 
-            # Emit llm:response event
+            # Convert to OllamaChatResponse FIRST (before emitting llm:response)
+            # so event usage fields come from the canonical ChatResponse
+            chat_response = self._convert_to_chat_response(
+                response, include_thinking=include_thinking
+            )
+
+            # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                # Build usage info
-                usage_info = {}
-                if "prompt_eval_count" in response:
-                    usage_info["input"] = response.get("prompt_eval_count", 0)
-                if "eval_count" in response:
-                    usage_info["output"] = response.get("eval_count", 0)
+                event_usage: dict[str, Any] = {}
+                if chat_response.usage:
+                    event_usage["input_tokens"] = chat_response.usage.input_tokens
+                    event_usage["output_tokens"] = chat_response.usage.output_tokens
+                    if chat_response.usage.cache_read_tokens is not None:
+                        event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
 
                 response_payload: dict[str, Any] = {
                     "provider": "ollama",
                     "model": model,
-                    "usage": usage_info,
+                    "usage": event_usage,
                     "status": "ok",
                     "duration_ms": elapsed_ms,
                 }
@@ -752,10 +758,7 @@ class OllamaProvider:
                     response_payload["raw"] = response
                 await self.coordinator.hooks.emit("llm:response", response_payload)
 
-            # Convert to OllamaChatResponse
-            return self._convert_to_chat_response(
-                response, include_thinking=include_thinking
-            )
+            return chat_response
 
         except LLMError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
