@@ -745,7 +745,9 @@ class OllamaProvider:
                     event_usage["input_tokens"] = chat_response.usage.input_tokens
                     event_usage["output_tokens"] = chat_response.usage.output_tokens
                     if chat_response.usage.cache_read_tokens is not None:
-                        event_usage["cache_read_tokens"] = chat_response.usage.cache_read_tokens
+                        event_usage["cache_read_tokens"] = (
+                            chat_response.usage.cache_read_tokens
+                        )
 
                 response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1055,19 +1057,31 @@ class OllamaProvider:
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.info("[PROVIDER] Streaming complete")
 
-            # Emit completion event
+            # Build final response FIRST (before emitting llm:response)
+            # so event usage fields come from the canonical ChatResponse
+            chat_response = self._build_streaming_response(
+                accumulated_content,
+                accumulated_thinking,
+                accumulated_tool_calls,
+                final_chunk,
+                include_thinking,
+            )
+
+            # Emit llm:response event using canonical usage fields from chat_response
             if self.coordinator and hasattr(self.coordinator, "hooks"):
-                usage_info = {}
-                if final_chunk:
-                    if "prompt_eval_count" in final_chunk:
-                        usage_info["input"] = final_chunk.get("prompt_eval_count", 0)
-                    if "eval_count" in final_chunk:
-                        usage_info["output"] = final_chunk.get("eval_count", 0)
+                event_usage: dict[str, Any] = {}
+                if chat_response.usage:
+                    event_usage["input_tokens"] = chat_response.usage.input_tokens
+                    event_usage["output_tokens"] = chat_response.usage.output_tokens
+                    if chat_response.usage.cache_read_tokens is not None:
+                        event_usage["cache_read_tokens"] = (
+                            chat_response.usage.cache_read_tokens
+                        )
 
                 stream_response_payload: dict[str, Any] = {
                     "provider": "ollama",
                     "model": model,
-                    "usage": usage_info,
+                    "usage": event_usage,
                     "status": "ok",
                     "duration_ms": elapsed_ms,
                     "stream": True,
@@ -1084,14 +1098,7 @@ class OllamaProvider:
                     "llm:response", stream_response_payload
                 )
 
-            # Build final response
-            return self._build_streaming_response(
-                accumulated_content,
-                accumulated_thinking,
-                accumulated_tool_calls,
-                final_chunk,
-                include_thinking,
-            )
+            return chat_response
 
         except LLMError as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
