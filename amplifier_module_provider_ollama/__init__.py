@@ -10,7 +10,9 @@ import asyncio
 import logging
 import os
 import time
+from urllib.parse import urlparse
 from collections import defaultdict
+from ._constants import CLOUD_DEFAULT_MODEL, LOCAL_DEFAULT_MODEL
 from typing import Any
 from uuid import uuid4
 
@@ -114,12 +116,16 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     Args:
         coordinator: Module coordinator
         config: Provider configuration including:
-            - host: Ollama server URL (default: from OLLAMA_HOST or http://localhost:11434)
-            - default_model: Model to use (default: "llama3.2:3b")
+            - mode: Deployment mode — "local" (default) or "cloud"
+            - host: Ollama server URL (default: from OLLAMA_HOST, or per-mode fallback)
+                    Local default: http://localhost:11434
+                    Cloud default: https://ollama.com
+            - default_model: Model to use (default: "gpt-oss:120b" for cloud, "llama3.2:3b" for local)
             - max_tokens: Maximum tokens (default: 4096)
             - temperature: Generation temperature (default: 0.7)
-            - timeout: Request timeout in seconds (default: 120)
-            - auto_pull: Whether to auto-pull missing models (default: False)
+            - timeout: Request timeout in seconds (default: 600)
+            - auto_pull: Whether to auto-pull missing models (default: False, local only)
+            - api_key: Ollama Cloud API key (default: from OLLAMA_API_KEY env var)
 
     Returns:
         Optional cleanup function
@@ -127,9 +133,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     config = config or {}
 
     # Get configuration with defaults
-    host = config.get("host", os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
-
-    provider = OllamaProvider(host, config, coordinator)
+    mode = config.get("mode")  # "local" | "cloud" | None
+    host = config.get("host") or os.environ.get("OLLAMA_HOST")
+    if not host:
+        host = "https://ollama.com" if mode == "cloud" else "http://localhost:11434"
+    api_key = config.get("api_key") or os.environ.get("OLLAMA_API_KEY")
+    provider = OllamaProvider(host, config, coordinator, api_key=api_key)
     await coordinator.mount("providers", provider, name="ollama")
 
     # Test connection but don't fail mount
@@ -149,7 +158,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
 
 class OllamaProvider:
-    """Ollama local LLM integration."""
+    """Ollama LLM integration (local and cloud)."""
 
     name = "ollama"
     api_label = "Ollama"
@@ -159,6 +168,7 @@ class OllamaProvider:
         host: str | None = None,
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
+        api_key: str | None = None,
     ):
         """
         Initialize Ollama provider.
@@ -172,12 +182,21 @@ class OllamaProvider:
             coordinator: Module coordinator for event emission
         """
         self.host = host
+        self._api_key: str | None = api_key
+        self._headers: dict[str, str] | None = (
+            {"Authorization": f"Bearer {api_key}"} if api_key else None
+        )
         self._client: AsyncClient | None = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
 
-        # Configuration with sensible defaults
-        self.default_model = self.config.get("default_model", "llama3.2:3b")
+        # Configuration with sensible defaults — model default depends on mode.
+        # Cloud uses gpt-oss:120b (Ollama Cloud direct API model name, no `-cloud` suffix);
+        # local keeps llama3.2:3b. The user can always override via `default_model`.
+        # Constants are sourced from _constants.py (single source of truth).
+        _mode = self.config.get("mode")
+        _mode_default = CLOUD_DEFAULT_MODEL if _mode == "cloud" else LOCAL_DEFAULT_MODEL
+        self.default_model = self.config.get("default_model", _mode_default)
         self.max_tokens = self.config.get("max_tokens", 4096)
         self.temperature = self.config.get("temperature", 0.7)
         self.timeout = float(
@@ -244,18 +263,31 @@ class OllamaProvider:
         if self._client is None:
             if self.host is None:
                 raise ValueError("host must be provided for API calls")
-            self._client = AsyncClient(host=self.host)
+            self._client = AsyncClient(host=self.host, headers=self._headers)
         return self._client
+
+    @property
+    def is_cloud(self) -> bool:
+        """True when configured against Ollama Cloud (ollama.com or any subdomain)."""
+        if not self.host:
+            return False
+        try:
+            netloc = urlparse(self.host).netloc.lower()
+        except ValueError:
+            return False
+        # Strip port if present (e.g., "ollama.com:443" → "ollama.com")
+        netloc = netloc.split(":")[0]
+        return netloc == "ollama.com" or netloc.endswith(".ollama.com")
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
         return ProviderInfo(
             id="ollama",
             display_name="Ollama",
-            credential_env_vars=[],  # No API key needed for local Ollama
-            capabilities=["streaming", "tools", "local"],
+            credential_env_vars=["OLLAMA_API_KEY"],
+            capabilities=["streaming", "tools", "cloud" if self.is_cloud else "local"],
             defaults={
-                "model": "llama3.2:3b",
+                "model": self.default_model,
                 "max_tokens": 4096,
                 "temperature": 0.7,
                 "timeout": 600.0,
@@ -264,6 +296,16 @@ class OllamaProvider:
             },
             config_fields=[
                 ConfigField(
+                    id="mode",
+                    display_name="Deployment Mode",
+                    field_type="choice",
+                    prompt="Run Ollama locally or use Ollama Cloud?",
+                    choices=["local", "cloud"],
+                    default="local",
+                    required=True,
+                ),
+                # Local-only host (default localhost)
+                ConfigField(
                     id="host",
                     display_name="Ollama Host",
                     field_type="text",
@@ -271,7 +313,29 @@ class OllamaProvider:
                     env_var="OLLAMA_HOST",
                     default="http://localhost:11434",
                     required=False,
+                    show_when={"mode": "local"},
                 ),
+                # Cloud-only host (default ollama.com, exposed for transparency)
+                ConfigField(
+                    id="host",
+                    display_name="Ollama Cloud Endpoint",
+                    field_type="text",
+                    prompt="Ollama Cloud API endpoint",
+                    default="https://ollama.com",
+                    required=False,
+                    show_when={"mode": "cloud"},
+                ),
+                # Cloud-only API key (required when mode=cloud)
+                ConfigField(
+                    id="api_key",
+                    display_name="API Key",
+                    field_type="secret",
+                    prompt="Enter your Ollama Cloud API key",
+                    env_var="OLLAMA_API_KEY",
+                    required=True,
+                    show_when={"mode": "cloud"},
+                ),
+                # Local-only auto_pull (cloud doesn't support pull)
                 ConfigField(
                     id="auto_pull",
                     display_name="Auto-Pull Models",
@@ -279,6 +343,7 @@ class OllamaProvider:
                     prompt="Automatically pull missing models?",
                     default="false",
                     required=False,
+                    show_when={"mode": "local"},
                 ),
                 ConfigField(
                     id="enable_thinking",
@@ -328,7 +393,7 @@ class OllamaProvider:
             List of capability strings
         """
         name_lower = model_name.lower()
-        caps = ["streaming", "local"]
+        caps = ["streaming", "cloud" if self.is_cloud else "local"]
 
         # Most models support tools now
         caps.append("tools")
@@ -418,13 +483,27 @@ class OllamaProvider:
             return False
 
     async def _ensure_model_available(self, model: str) -> bool:
-        """Check if model is available, attempt to pull if not and auto_pull is enabled."""
+        """Check if model is available, attempt to pull if not and auto_pull is enabled.
+
+        When running against Ollama Cloud (is_cloud=True), pulling is not supported.
+        show() is still attempted for an availability check, but a failure there only
+        logs a warning and returns True so that the actual chat call can proceed — the
+        cloud service controls model availability and may surface a clearer error.
+        """
         try:
             # Try to get model info
             await self.client.show(model)
             return True
         except ResponseError as e:
             if e.status_code == 404:
+                if self.is_cloud:
+                    # Cloud does not support pulling — log a warning and let the
+                    # subsequent chat call fail with a proper error if needed.
+                    logger.warning(
+                        f"Model {model} not found via Ollama Cloud show(). "
+                        "Skipping pull (not supported on cloud); the chat call may fail."
+                    )
+                    return True
                 if self.auto_pull:
                     logger.info(f"Model {model} not found, pulling...")
                     try:
@@ -439,6 +518,14 @@ class OllamaProvider:
                     )
                     return False
             return False
+        except Exception as e:
+            if self.is_cloud:
+                # Cloud availability check failures should not block requests.
+                logger.debug(
+                    f"Ollama Cloud show() for {model} raised {type(e).__name__}: {e}"
+                )
+                return True
+            raise
 
     async def _get_model_context_length(self, model: str) -> int:
         """Get context length for a model, with caching.
