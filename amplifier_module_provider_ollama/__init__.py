@@ -49,6 +49,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONTEXT_LENGTH = 8192
 
 
+def _is_cloud_host(host: str | None) -> bool:
+    """True when host points at Ollama Cloud (ollama.com or any subdomain).
+
+    URL-parse based to defend against lookalike hosts such as
+    ``http://evil.ollama.com.attacker.io`` or ``https://notollama.com``.
+    This is THE single source of truth for cloud-vs-local runtime decisions
+    (default model selection, capability tagging, skip-pull behavior).
+    """
+    if not host:
+        return False
+    try:
+        netloc = urlparse(host).netloc.lower()
+    except ValueError:
+        return False
+    netloc = netloc.split(":")[0]  # strip port (e.g., "ollama.com:443")
+    return netloc == "ollama.com" or netloc.endswith(".ollama.com")
+
+
 class OllamaChatResponse(ChatResponse):
     """Extended ChatResponse with Ollama-specific metadata."""
 
@@ -116,27 +134,35 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     Args:
         coordinator: Module coordinator
         config: Provider configuration including:
-            - mode: Deployment mode — "local" (default) or "cloud"
-            - host: Ollama server URL (default: from OLLAMA_HOST, or per-mode fallback)
-                    Local default: http://localhost:11434
-                    Cloud default: https://ollama.com
-            - default_model: Model to use (default: "gpt-oss:120b" for cloud, "llama3.2:3b" for local)
+            - host: Ollama server URL (default: from OLLAMA_HOST or http://localhost:11434).
+                    Use https://ollama.com for Ollama Cloud. The host URL is the
+                    single source of truth — local-vs-cloud is derived from it.
+            - default_model: Model to use. Defaults are host-derived: gpt-oss:120b
+                    for Ollama Cloud (host on ollama.com), llama3.2:3b otherwise.
             - max_tokens: Maximum tokens (default: 4096)
             - temperature: Generation temperature (default: 0.7)
             - timeout: Request timeout in seconds (default: 600)
-            - auto_pull: Whether to auto-pull missing models (default: False, local only)
-            - api_key: Ollama Cloud API key (default: from OLLAMA_API_KEY env var)
+            - auto_pull: Whether to auto-pull missing models (default: False;
+                    silently ignored for cloud hosts since pull isn't supported).
+            - api_key: Ollama Cloud API key (default: from OLLAMA_API_KEY env var).
+                    Used to attach Authorization: Bearer when set; harmless if unset.
+
+        To run a mix of local + cloud simultaneously, configure two provider
+        instances with different ``instance_id`` values — see the README
+        "Mixed local + cloud (multi-instance)" section for an example.
 
     Returns:
         Optional cleanup function
     """
     config = config or {}
 
-    # Get configuration with defaults
-    mode = config.get("mode")  # "local" | "cloud" | None
-    host = config.get("host") or os.environ.get("OLLAMA_HOST")
-    if not host:
-        host = "https://ollama.com" if mode == "cloud" else "http://localhost:11434"
+    # Single source of truth: the `host` URL drives all downstream decisions
+    # (cloud-vs-local detection, default_model, capabilities, skip-pull).
+    # Legacy configs containing a `mode` key are silently ignored — `mode`
+    # was removed in favor of host-based derivation. To run a mix of local
+    # + cloud, configure two provider instances with different `instance_id`
+    # values (see README).
+    host = config.get("host") or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     api_key = config.get("api_key") or os.environ.get("OLLAMA_API_KEY")
     provider = OllamaProvider(host, config, coordinator, api_key=api_key)
     await coordinator.mount("providers", provider, name="ollama")
@@ -183,6 +209,11 @@ class OllamaProvider:
         """
         self.host = host
         self._api_key: str | None = api_key
+        # Authorization: Bearer is attached whenever an api_key is supplied,
+        # regardless of host. This keeps custom auth-proxy deployments working
+        # (some users put a Bearer-auth proxy in front of a local Ollama).
+        # The is_cloud check below governs SEMANTIC behavior (default_model,
+        # capability tags, skip-pull), not raw header attachment.
         self._headers: dict[str, str] | None = (
             {"Authorization": f"Bearer {api_key}"} if api_key else None
         )
@@ -190,13 +221,18 @@ class OllamaProvider:
         self.config = config or {}
         self.coordinator = coordinator
 
-        # Configuration with sensible defaults — model default depends on mode.
-        # Cloud uses gpt-oss:120b (Ollama Cloud direct API model name, no `-cloud` suffix);
-        # local keeps llama3.2:3b. The user can always override via `default_model`.
-        # Constants are sourced from _constants.py (single source of truth).
-        _mode = self.config.get("mode")
-        _mode_default = CLOUD_DEFAULT_MODEL if _mode == "cloud" else LOCAL_DEFAULT_MODEL
-        self.default_model = self.config.get("default_model", _mode_default)
+        # Single source of truth: host URL determines local-vs-cloud. Cached
+        # here so we don't re-parse the URL on every property access (used in
+        # capabilities, default_model selection, skip-pull behavior, etc.).
+        self._is_cloud_cached: bool = _is_cloud_host(host)
+
+        # Default model is host-derived — gpt-oss:120b for Ollama Cloud,
+        # llama3.2:3b otherwise. Override via `default_model` in config.
+        # Constants come from _constants.py (single source of truth for names).
+        _host_default = (
+            CLOUD_DEFAULT_MODEL if self._is_cloud_cached else LOCAL_DEFAULT_MODEL
+        )
+        self.default_model = self.config.get("default_model", _host_default)
         self.max_tokens = self.config.get("max_tokens", 4096)
         self.temperature = self.config.get("temperature", 0.7)
         self.timeout = float(
@@ -268,16 +304,12 @@ class OllamaProvider:
 
     @property
     def is_cloud(self) -> bool:
-        """True when configured against Ollama Cloud (ollama.com or any subdomain)."""
-        if not self.host:
-            return False
-        try:
-            netloc = urlparse(self.host).netloc.lower()
-        except ValueError:
-            return False
-        # Strip port if present (e.g., "ollama.com:443" → "ollama.com")
-        netloc = netloc.split(":")[0]
-        return netloc == "ollama.com" or netloc.endswith(".ollama.com")
+        """True when configured against Ollama Cloud.
+
+        Returns the value cached in ``__init__`` — see :func:`_is_cloud_host`
+        for the URL-parse logic that defends against lookalike hosts.
+        """
+        return self._is_cloud_cached
 
     def get_info(self) -> ProviderInfo:
         """Get provider metadata."""
@@ -295,47 +327,42 @@ class OllamaProvider:
                 "max_output_tokens": 64000,
             },
             config_fields=[
-                ConfigField(
-                    id="mode",
-                    display_name="Deployment Mode",
-                    field_type="choice",
-                    prompt="Run Ollama locally or use Ollama Cloud?",
-                    choices=["local", "cloud"],
-                    default="local",
-                    required=True,
-                ),
-                # Local-only host (default localhost)
+                # Single host field — THE single source of truth for local-vs-cloud.
+                # Use http://localhost:11434 for local, https://ollama.com for
+                # Ollama Cloud, or any custom URL for a self-hosted/proxied
+                # deployment. To run BOTH local AND cloud simultaneously,
+                # configure two provider instances with different ``instance_id``
+                # values (see README "Mixed local + cloud").
                 ConfigField(
                     id="host",
                     display_name="Ollama Host",
                     field_type="text",
-                    prompt="Ollama server URL",
+                    prompt="Ollama server URL (use https://ollama.com for Ollama Cloud)",
                     env_var="OLLAMA_HOST",
                     default="http://localhost:11434",
                     required=False,
-                    show_when={"mode": "local"},
                 ),
-                # Cloud-only host (default ollama.com, exposed for transparency)
-                ConfigField(
-                    id="host",
-                    display_name="Ollama Cloud Endpoint",
-                    field_type="text",
-                    prompt="Ollama Cloud API endpoint",
-                    default="https://ollama.com",
-                    required=False,
-                    show_when={"mode": "cloud"},
-                ),
-                # Cloud-only API key (required when mode=cloud)
+                # API key — only PROMPTED when host contains "ollama.com".
+                # NOTE: ``contains:ollama.com`` is intentionally more permissive
+                # than the runtime is_cloud check (which urlparses to defend
+                # against lookalike hosts like ``evil.ollama.com.attacker.io``).
+                # At init time this only governs whether to PROMPT for a key;
+                # the runtime decision about whether to attach Authorization:
+                # Bearer is governed solely by the api_key being set, so users
+                # with custom auth proxies (Bearer-auth in front of a local
+                # Ollama) still work without any host-name acrobatics.
                 ConfigField(
                     id="api_key",
                     display_name="API Key",
                     field_type="secret",
                     prompt="Enter your Ollama Cloud API key",
                     env_var="OLLAMA_API_KEY",
-                    required=True,
-                    show_when={"mode": "cloud"},
+                    required=False,
+                    show_when={"host": "contains:ollama.com"},
                 ),
-                # Local-only auto_pull (cloud doesn't support pull)
+                # auto_pull — Ollama Cloud doesn't support `ollama pull`, so
+                # only prompt for non-cloud hosts. Runtime code skips pull()
+                # for cloud regardless (defense in depth).
                 ConfigField(
                     id="auto_pull",
                     display_name="Auto-Pull Models",
@@ -343,7 +370,7 @@ class OllamaProvider:
                     prompt="Automatically pull missing models?",
                     default="false",
                     required=False,
-                    show_when={"mode": "local"},
+                    show_when={"host": "not_contains:ollama.com"},
                 ),
                 ConfigField(
                     id="enable_thinking",

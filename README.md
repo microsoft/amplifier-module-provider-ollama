@@ -14,16 +14,27 @@ Local LLM provider integration for Amplifier using Ollama.
 
 ## Configuration
 
+`host` is the **single source of truth** — local-vs-cloud is derived from
+the URL. Set it to `http://localhost:11434` for a local Ollama, or
+`https://ollama.com` for Ollama Cloud. The provider then automatically
+picks sensible defaults (model, capability tags, pull behavior) for that
+deployment.
+
 ```python
 {
-    "host": "http://localhost:11434",  # Ollama server URL (or set OLLAMA_HOST env var)
-    "default_model": "llama3.2:3b",    # Default model to use
+    "host": "http://localhost:11434",  # Ollama server URL (or set OLLAMA_HOST)
+                                       # Use https://ollama.com for Ollama Cloud.
+    "api_key": None,                   # Required for Ollama Cloud. Read from
+                                       # OLLAMA_API_KEY env var if not set.
+    "default_model": None,             # Defaults to "gpt-oss:120b" for cloud,
+                                       # "llama3.2:3b" otherwise.
     "max_tokens": 4096,                # Maximum tokens to generate
     "temperature": 0.7,                # Generation temperature
-    "timeout": 300,                    # Request timeout in seconds (default: 5 minutes)
-    "debug": false,                    # Enable standard debug events
-    "raw_debug": false,                # Enable ultra-verbose raw API I/O logging
-    "auto_pull": false                 # Automatically pull missing models
+    "timeout": 600,                    # Request timeout (seconds; 10 min default)
+    "auto_pull": False,                # Auto-pull missing models (local only;
+                                       # silently ignored for Ollama Cloud).
+    "debug": False,                    # Enable standard debug events
+    "raw_debug": False,                # Enable ultra-verbose raw API I/O logging
 }
 ```
 
@@ -76,16 +87,87 @@ providers:
 ### Configuration File
 
 ```toml
-[provider]
-name = "ollama"
-model = "llama3.2:3b"
+[[providers]]
+module = "amplifier-module-provider-ollama"
+
+[providers.config]
 host = "http://localhost:11434"
+default_model = "llama3.2:3b"
 auto_pull = true
 ```
 
 ### Environment Variables
 
 - `OLLAMA_HOST`: Override default Ollama server URL
+- `OLLAMA_API_KEY`: API key for Ollama Cloud (only used when `host`
+  points at a remote endpoint that requires Bearer auth)
+
+## Authentication
+
+The provider uses a single, simple convention:
+
+- **Local Ollama** (`host = "http://localhost:11434"`): no auth.
+- **Ollama Cloud** (`host = "https://ollama.com"`): set `api_key` (or
+  `OLLAMA_API_KEY` env var). The provider attaches an
+  `Authorization: Bearer <key>` header to every request.
+- **Custom auth proxy** (any other URL with `api_key` set): the same
+  `Authorization: Bearer <key>` header is attached. Useful when you
+  front a local Ollama with a Bearer-auth reverse proxy.
+
+The decision about whether to *attach* the header is governed solely by
+whether `api_key` is present. The decision about *cloud-only behaviors*
+(skipping `ollama pull`, defaulting to `gpt-oss:120b`, advertising the
+`cloud` capability tag) is governed by the host URL — specifically a
+URL-parsed match against `ollama.com` or any subdomain. Lookalike hosts
+like `evil.ollama.com.attacker.io` are correctly rejected.
+
+## Mixed local + cloud (multi-instance)
+
+To use **both** local Ollama and Ollama Cloud in the same session — for
+example, routing heavy reasoning to `gpt-oss:120b` on Ollama Cloud while
+keeping `llama3.2:3b` local for fast utility tasks — configure two
+provider instances. Amplifier's kernel supports multiple named instances
+of the same module via the `instance_id` key:
+
+```toml
+# Default local instance — keeps the natural mount name "ollama"
+[[providers]]
+module = "amplifier-module-provider-ollama"
+[providers.config]
+host = "http://localhost:11434"
+auto_pull = true
+
+# Second instance — explicit `instance_id` makes it addressable as "ollama-cloud"
+[[providers]]
+module = "amplifier-module-provider-ollama"
+instance_id = "ollama-cloud"
+[providers.config]
+host = "https://ollama.com"
+api_key = "${OLLAMA_API_KEY}"
+```
+
+A routing matrix can then target each independently:
+
+```yaml
+roles:
+  reasoning:
+    candidates:
+      - provider: ollama-cloud
+        model: gpt-oss:120b
+      - provider: ollama
+        model: "deepseek-r1:*"
+  fast:
+    candidates:
+      - provider: ollama
+        model: "llama3.2:*"
+```
+
+> **Backward compat note.** Earlier releases of this provider exposed a
+> `mode` config field (with values `local`/`cloud`) plus a duplicate-id
+> `host` ConfigField gated by `mode`. Both have been removed in favor of
+> the host-as-SSOT design above. Existing TOML configs containing a stray
+> `mode` key are silently ignored — no re-init required. The `OLLAMA_HOST`
+> and `OLLAMA_API_KEY` env vars continue to work unchanged.
 
 ## Supported Models
 
