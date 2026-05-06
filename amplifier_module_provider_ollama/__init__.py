@@ -10,9 +10,11 @@ import asyncio
 import logging
 import os
 import time
+from decimal import Decimal
 from urllib.parse import urlparse
 from collections import defaultdict
 from ._constants import CLOUD_DEFAULT_MODEL, LOCAL_DEFAULT_MODEL
+from ._cost import compute_cost
 from typing import Any
 from uuid import uuid4
 
@@ -155,6 +157,29 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         Optional cleanup function
     """
     config = config or {}
+
+    # ---------------------------------------------------------------------------
+    # Cost accumulation hook and session.cost contributor
+    # Ollama is self-hosted — cost is always indeterminate (None), never $0.00.
+    # The _accumulate hook's `if raw is not None` branch is never taken,
+    # so the contributor always returns None (correct semantics).
+    # ---------------------------------------------------------------------------
+    _totals: dict = {"cost_usd": None, "has_data": False}
+
+    async def _accumulate(event: str, data: dict) -> None:
+        raw = (data.get("usage") or {}).get("cost_usd")
+        if raw is not None:
+            _totals["cost_usd"] = (_totals["cost_usd"] or Decimal("0")) + Decimal(
+                str(raw)
+            )
+            _totals["has_data"] = True
+
+    coordinator.hooks.register("llm:response", _accumulate)
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-ollama",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
 
     # Single source of truth: the `host` URL drives all downstream decisions
     # (cloud-vs-local detection, default_model, capabilities, skip-pull).
@@ -862,6 +887,10 @@ class OllamaProvider:
                         event_usage["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
+                    _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = (
+                        str(_cost_usd) if _cost_usd is not None else None
+                    )
 
                 response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1191,6 +1220,10 @@ class OllamaProvider:
                         event_usage["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
+                    _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = (
+                        str(_cost_usd) if _cost_usd is not None else None
+                    )
 
                 stream_response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1781,6 +1814,14 @@ class OllamaProvider:
             total_tokens=response.get("prompt_eval_count", 0)
             + response.get("eval_count", 0),
         )
+
+        # Stamp cost_usd — Ollama is self-hosted so cost is always indeterminate (None).
+        cost = compute_cost(
+            response.get("model", ""),
+            input_tokens=response.get("prompt_eval_count", 0),
+            output_tokens=response.get("eval_count", 0),
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
