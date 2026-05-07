@@ -93,8 +93,8 @@ async def test_contributor_always_returns_none_after_events(mock_coordinator):
     ]
 
     # Ollama always emits cost_usd=None
-    await accumulate("llm:response", {"usage": {"cost_usd": None}})
-    await accumulate("llm:response", {"usage": {"cost_usd": None}})
+    await accumulate("llm:response", {"provider": "ollama", "usage": {"cost_usd": None}})
+    await accumulate("llm:response", {"provider": "ollama", "usage": {"cost_usd": None}})
 
     assert callback() is None, (
         "Contributor should always return None for self-hosted Ollama"
