@@ -905,9 +905,7 @@ class OllamaProvider:
                             chat_response.usage.cache_read_tokens
                         )
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = (
-                        str(_cost_usd) if _cost_usd is not None else None
-                    )
+                    event_usage["cost_usd"] = _cost_usd
 
                 response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1238,9 +1236,7 @@ class OllamaProvider:
                             chat_response.usage.cache_read_tokens
                         )
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = (
-                        str(_cost_usd) if _cost_usd is not None else None
-                    )
+                    event_usage["cost_usd"] = _cost_usd
 
                 stream_response_payload: dict[str, Any] = {
                     "provider": "ollama",
