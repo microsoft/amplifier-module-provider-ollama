@@ -158,12 +158,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     """
     config = config or {}
 
-    # ---------------------------------------------------------------------------
-    # Cost accumulation hook and session.cost contributor
-    # Ollama is self-hosted — cost is always indeterminate (None), never $0.00.
-    # The _accumulate hook's `if raw is not None` branch is never taken,
-    # so the contributor always returns None (correct semantics).
-    # ---------------------------------------------------------------------------
     # Single source of truth: the `host` URL drives all downstream decisions
     # (cloud-vs-local detection, default_model, capabilities, skip-pull).
     # Legacy configs containing a `mode` key are silently ignored — `mode`
