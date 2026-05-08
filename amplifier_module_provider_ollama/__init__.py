@@ -1821,6 +1821,7 @@ class OllamaProvider:
             output_tokens=response.get("eval_count", 0),
         )
         usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
 
 
         combined_text = "\n\n".join(text_accumulator).strip()
