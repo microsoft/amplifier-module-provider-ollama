@@ -10,9 +10,11 @@ import asyncio
 import logging
 import os
 import time
+from decimal import Decimal
 from urllib.parse import urlparse
 from collections import defaultdict
 from ._constants import CLOUD_DEFAULT_MODEL, LOCAL_DEFAULT_MODEL
+from ._cost import compute_cost
 from typing import Any
 from uuid import uuid4
 
@@ -164,8 +166,23 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # values (see README).
     host = config.get("host") or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     api_key = config.get("api_key") or os.environ.get("OLLAMA_API_KEY")
-    provider = OllamaProvider(host, config, coordinator, api_key=api_key)
+
+    _totals: dict[str, Any] = {"cost_usd": Decimal(0), "has_data": False}
+
+    def _add_cost(cost: Decimal | None) -> None:
+        if cost is not None:
+            _totals["cost_usd"] += cost
+            _totals["has_data"] = True
+
+    provider = OllamaProvider(
+        host, config, coordinator, api_key=api_key, add_cost=_add_cost
+    )
     await coordinator.mount("providers", provider, name="ollama")
+    coordinator.register_contributor(
+        "session.cost",
+        "provider-ollama",
+        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+    )
 
     # Test connection but don't fail mount
     if not await provider._check_connection():
@@ -195,6 +212,7 @@ class OllamaProvider:
         config: dict[str, Any] | None = None,
         coordinator: ModuleCoordinator | None = None,
         api_key: str | None = None,
+        add_cost=None,
     ):
         """
         Initialize Ollama provider.
@@ -220,6 +238,7 @@ class OllamaProvider:
         self._client: AsyncClient | None = None  # Lazy init
         self.config = config or {}
         self.coordinator = coordinator
+        self._add_cost = add_cost or (lambda cost: None)
 
         # Single source of truth: host URL determines local-vs-cloud. Cached
         # here so we don't re-parse the URL on every property access (used in
@@ -862,6 +881,8 @@ class OllamaProvider:
                         event_usage["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
+                    _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = _cost_usd
 
                 response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1191,6 +1212,8 @@ class OllamaProvider:
                         event_usage["cache_read_tokens"] = (
                             chat_response.usage.cache_read_tokens
                         )
+                    _cost_usd = getattr(chat_response.usage, "cost_usd", None)
+                    event_usage["cost_usd"] = _cost_usd
 
                 stream_response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1342,6 +1365,15 @@ class OllamaProvider:
                 else 0
             ),
         )
+
+        # Stamp cost_usd — Ollama is self-hosted so cost is always indeterminate (None).
+        cost = compute_cost(
+            final_chunk.get("model", "") if final_chunk else "",
+            input_tokens=final_chunk.get("prompt_eval_count", 0) if final_chunk else 0,
+            output_tokens=final_chunk.get("eval_count", 0) if final_chunk else 0,
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
 
         return OllamaChatResponse(
             content=content_blocks,
@@ -1781,6 +1813,15 @@ class OllamaProvider:
             total_tokens=response.get("prompt_eval_count", 0)
             + response.get("eval_count", 0),
         )
+
+        # Stamp cost_usd — Ollama is self-hosted so cost is always indeterminate (None).
+        cost = compute_cost(
+            response.get("model", ""),
+            input_tokens=response.get("prompt_eval_count", 0),
+            output_tokens=response.get("eval_count", 0),
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
