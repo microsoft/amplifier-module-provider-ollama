@@ -1366,6 +1366,15 @@ class OllamaProvider:
             ),
         )
 
+        # Stamp cost_usd — Ollama is self-hosted so cost is always indeterminate (None).
+        cost = compute_cost(
+            final_chunk.get("model", "") if final_chunk else "",
+            input_tokens=final_chunk.get("prompt_eval_count", 0) if final_chunk else 0,
+            output_tokens=final_chunk.get("eval_count", 0) if final_chunk else 0,
+        )
+        usage = usage.model_copy(update={"cost_usd": cost})
+        self._add_cost(cost)
+
         return OllamaChatResponse(
             content=content_blocks,
             tool_calls=tool_calls if tool_calls else None,
