@@ -181,7 +181,15 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     coordinator.register_contributor(
         "session.cost",
         "provider-ollama",
-        lambda: {"cost_usd": _totals["cost_usd"]} if _totals["has_data"] else None,
+        lambda: (
+            {
+                "cost_usd": str(_totals["cost_usd"])
+                if _totals["cost_usd"] is not None
+                else None
+            }
+            if _totals["has_data"]
+            else None
+        ),
     )
 
     # Test connection but don't fail mount
@@ -882,7 +890,7 @@ class OllamaProvider:
                             chat_response.usage.cache_read_tokens
                         )
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = _cost_usd
+                    event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
 
                 response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1213,7 +1221,7 @@ class OllamaProvider:
                             chat_response.usage.cache_read_tokens
                         )
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = _cost_usd
+                    event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
 
                 stream_response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1822,6 +1830,7 @@ class OllamaProvider:
         )
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)
+
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
