@@ -90,7 +90,7 @@ async def test_llm_request_event_emitted_without_raw_field_by_default(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     request_events = [
         payload
@@ -112,7 +112,7 @@ async def test_llm_request_event_has_raw_field_when_raw_true(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     request_events = [
         payload
@@ -134,7 +134,7 @@ async def test_llm_request_debug_event_never_emitted(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     debug_events = [
         name
@@ -155,7 +155,7 @@ async def test_llm_request_raw_event_never_emitted(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     raw_events = [
         name
@@ -176,7 +176,7 @@ async def test_llm_request_base_payload_fields_present(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     request_events = [
         payload
@@ -204,7 +204,7 @@ async def test_llm_response_event_emitted_without_raw_field_by_default(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload
@@ -226,7 +226,7 @@ async def test_llm_response_event_has_raw_field_when_raw_true(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload
@@ -248,7 +248,7 @@ async def test_llm_response_debug_event_never_emitted(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     debug_events = [
         name
@@ -269,7 +269,7 @@ async def test_llm_response_raw_event_never_emitted(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     raw_events = [
         name
@@ -290,7 +290,7 @@ async def test_llm_response_base_payload_fields_present(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload
@@ -319,7 +319,7 @@ async def test_only_two_base_llm_events_non_streaming_raw_false(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     llm_events = [
         name for name, _ in provider.coordinator.hooks.events if name.startswith("llm:")
@@ -340,7 +340,7 @@ async def test_only_two_base_llm_events_non_streaming_raw_true(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     llm_events = [
         name for name, _ in provider.coordinator.hooks.events if name.startswith("llm:")

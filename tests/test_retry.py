@@ -104,7 +104,7 @@ class TestRetryBehavior:
         provider.client.chat = AsyncMock(side_effect=[err, mock_response()])
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await provider.complete(simple_request())
+            result = await provider.complete(simple_request(metadata={"stream": False}))
 
         assert result is not None
         assert provider.client.chat.await_count == 2
@@ -162,7 +162,7 @@ class TestRetryBehavior:
         provider.client.chat = AsyncMock(side_effect=[err, mock_response()])
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await provider.complete(simple_request())
+            result = await provider.complete(simple_request(metadata={"stream": False}))
 
         assert result is not None
         assert provider.client.chat.await_count == 2
@@ -177,7 +177,7 @@ class TestRetryBehavior:
         )
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await provider.complete(simple_request())
+            result = await provider.complete(simple_request(metadata={"stream": False}))
 
         assert result is not None
         assert provider.client.chat.await_count == 2
@@ -192,7 +192,7 @@ class TestRetryBehavior:
         )
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await provider.complete(simple_request())
+            result = await provider.complete(simple_request(metadata={"stream": False}))
 
         assert result is not None
         assert provider.client.chat.await_count == 2
@@ -215,7 +215,7 @@ class TestRetryEventEmission:
         provider.client.chat = AsyncMock(side_effect=[err, mock_response()])
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            await provider.complete(simple_request())
+            await provider.complete(simple_request(metadata={"stream": False}))
 
         hooks = provider.coordinator.hooks  # type: ignore[union-attr]
         retry_events = [(n, p) for n, p in hooks.events if n == "provider:retry"]
@@ -239,7 +239,7 @@ class TestRetryEventEmission:
         provider.client.chat = AsyncMock(side_effect=[err, err, err, mock_response()])
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            await provider.complete(simple_request())
+            await provider.complete(simple_request(metadata={"stream": False}))
 
         hooks = provider.coordinator.hooks  # type: ignore[union-attr]
         retry_events = [(n, p) for n, p in hooks.events if n == "provider:retry"]
