@@ -290,7 +290,7 @@ class TestReasoningEffort:
         provider = make_provider(default_model="deepseek-r1:14b", enable_thinking=False)
         provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = simple_request(reasoning_effort="high")
+        request = simple_request(reasoning_effort="high", metadata={"stream": False})
         await provider.complete(request, model="deepseek-r1:14b")
 
         call_kwargs = provider.client.chat.call_args
@@ -307,7 +307,7 @@ class TestReasoningEffort:
         provider = make_provider(default_model="llama3.2:3b", enable_thinking=False)
         provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = simple_request(reasoning_effort="medium")
+        request = simple_request(reasoning_effort="medium", metadata={"stream": False})
         await provider.complete(request, model="llama3.2:3b")
 
         call_kwargs = provider.client.chat.call_args
@@ -325,7 +325,7 @@ class TestReasoningEffort:
         )
         provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = simple_request()  # reasoning_effort defaults to None
+        request = simple_request(metadata={"stream": False})  # reasoning_effort defaults to None
         await provider.complete(request, model="qwen3:8b")
 
         call_kwargs = provider.client.chat.call_args
@@ -347,7 +347,7 @@ class TestReasoningEffort:
         provider.client.chat = AsyncMock(return_value=mock_response())
 
         # Simulate enable_thinking on request (existing kwargs path)
-        request = simple_request(reasoning_effort="medium")
+        request = simple_request(reasoning_effort="medium", metadata={"stream": False})
         # Manually set enable_thinking to test precedence
         request.enable_thinking = True  # type: ignore[attr-defined]
         await provider.complete(request, model="qwen3:8b")
@@ -366,7 +366,7 @@ class TestReasoningEffort:
         provider = make_provider(default_model="deepseek-r1:14b", enable_thinking=False)
         provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = simple_request(reasoning_effort="low")
+        request = simple_request(reasoning_effort="low", metadata={"stream": False})
         await provider.complete(request, model="deepseek-r1:14b")
 
         call_kwargs = provider.client.chat.call_args

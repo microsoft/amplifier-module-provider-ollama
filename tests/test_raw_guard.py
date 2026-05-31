@@ -19,7 +19,7 @@ async def test_no_tiered_raw_events_when_raw_false(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     raw_events = [
         name for name, _ in provider.coordinator.hooks.events if name.endswith(":raw")
@@ -36,7 +36,7 @@ async def test_no_tiered_raw_events_when_raw_true(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     raw_events = [
         name for name, _ in provider.coordinator.hooks.events if name.endswith(":raw")
@@ -55,7 +55,7 @@ async def test_no_tiered_debug_events_when_raw_true(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     debug_events = [
         name for name, _ in provider.coordinator.hooks.events if name.endswith(":debug")
@@ -72,7 +72,7 @@ async def test_raw_field_on_base_events_when_raw_true(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     request_events = [
         payload

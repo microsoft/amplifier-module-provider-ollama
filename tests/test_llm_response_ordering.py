@@ -21,7 +21,7 @@ async def test_llm_response_uses_canonical_input_tokens_key(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload
@@ -49,7 +49,7 @@ async def test_llm_response_uses_canonical_output_tokens_key(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        await provider.complete(simple_request())
+        await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload
@@ -78,7 +78,7 @@ async def test_llm_response_usage_values_match_chat_response(
     provider.client.chat = AsyncMock(return_value=mock_response())
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        result = await provider.complete(simple_request())
+        result = await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload

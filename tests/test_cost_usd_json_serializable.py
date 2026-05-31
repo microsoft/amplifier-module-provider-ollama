@@ -38,7 +38,7 @@ async def test_llm_response_event_is_json_serializable(
     provider = make_provider()
     provider.client.chat = AsyncMock(return_value=mock_response())
 
-    await provider.complete(simple_request())
+    await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload
@@ -75,7 +75,7 @@ async def test_llm_response_event_cost_usd_is_none(
     provider = make_provider()
     provider.client.chat = AsyncMock(return_value=mock_response())
 
-    await provider.complete(simple_request())
+    await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload
@@ -109,7 +109,7 @@ async def test_llm_response_event_cost_usd_round_trips_through_json(
     provider = make_provider()
     provider.client.chat = AsyncMock(return_value=mock_response())
 
-    await provider.complete(simple_request())
+    await provider.complete(simple_request(metadata={"stream": False}))
 
     response_events = [
         payload

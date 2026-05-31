@@ -51,7 +51,7 @@ def test_tool_call_sequence_missing_tool_message_is_repaired():
         ),
         Message(role="user", content="No tool result present"),
     ]
-    request = ChatRequest(messages=messages)
+    request = ChatRequest(messages=messages, metadata={"stream": False})
 
     asyncio.run(provider.complete(request))
 
@@ -102,7 +102,7 @@ def test_repaired_tool_ids_are_not_detected_again():
         ),
         Message(role="user", content="No tool result present"),
     ]
-    request = ChatRequest(messages=messages)
+    request = ChatRequest(messages=messages, metadata={"stream": False})
 
     # First call - should detect and repair
     asyncio.run(provider.complete(request))
@@ -130,7 +130,7 @@ def test_repaired_tool_ids_are_not_detected_again():
         ),
         Message(role="user", content="No tool result present"),
     ]
-    request_2 = ChatRequest(messages=messages_2)
+    request_2 = ChatRequest(messages=messages_2, metadata={"stream": False})
 
     asyncio.run(provider.complete(request_2))
 
@@ -162,7 +162,7 @@ def test_multiple_missing_tool_results_all_tracked():
         ),
         Message(role="user", content="No tool results"),
     ]
-    request = ChatRequest(messages=messages)
+    request = ChatRequest(messages=messages, metadata={"stream": False})
 
     asyncio.run(provider.complete(request))
 
@@ -199,7 +199,7 @@ def test_synthetic_results_inserted_before_subsequent_user_message():
         ),
         Message(role="user", content="What did the search return?"),
     ]
-    request = ChatRequest(messages=messages)
+    request = ChatRequest(messages=messages, metadata={"stream": False})
 
     asyncio.run(provider.complete(request))
 
@@ -245,7 +245,7 @@ def test_fm3_synthetic_assistant_inserted_before_next_user_message():
         ),
         Message(role="user", content="Continue please"),
     ]
-    request = ChatRequest(messages=messages)
+    request = ChatRequest(messages=messages, metadata={"stream": False})
 
     asyncio.run(provider.complete(request))
 
@@ -305,7 +305,7 @@ def test_fm3_not_inserted_when_no_following_user_message():
             ],
         ),
     ]
-    request = ChatRequest(messages=messages)
+    request = ChatRequest(messages=messages, metadata={"stream": False})
 
     asyncio.run(provider.complete(request))
 

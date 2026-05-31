@@ -636,8 +636,13 @@ class OllamaProvider:
         Returns:
             OllamaChatResponse with content blocks, tool calls, usage, and optional thinking
         """
-        # Check if streaming is requested
-        if hasattr(request, "stream") and request.stream:
+        # Streaming is the default; opt out via request.metadata["stream"] is False
+        # (identity check, not truthiness) or config use_streaming=False.
+        _meta = getattr(request, "metadata", None)
+        _use_streaming = self.config.get("use_streaming", True)
+        if isinstance(_meta, dict) and _meta.get("stream") is False:
+            _use_streaming = False
+        if _use_streaming:
             return await self._complete_streaming(request, **kwargs)
         return await self._complete_chat_request(request, **kwargs)
 
@@ -1119,6 +1124,14 @@ class OllamaProvider:
         accumulated_tool_calls: list[dict[str, Any]] = []
         final_chunk: dict[str, Any] | None = None
 
+        # --- streaming contract tracking (provider-streaming-contract.md) ---
+        request_id = str(uuid4())
+        seq: dict[int, int] = {}          # block_index -> next sequence number
+        block_index = 0
+        current_block_type: str | None = None
+        partial_emitted = False
+        hooks_available = bool(self.coordinator and hasattr(self.coordinator, "hooks"))
+
         # Inner function: wraps the initial stream connection with error
         # translation so that retry_with_backoff sees LLMError subclasses and
         # can check .retryable to decide whether to retry.
@@ -1170,31 +1183,120 @@ class OllamaProvider:
             # the outer except blocks below.
             async for chunk in stream:
                 message = chunk.get("message", {})
+                thinking_delta = message.get("thinking") or ""
+                content_delta = message.get("content") or ""
 
-                # Handle content chunks
-                if message.get("content"):
-                    accumulated_content += message["content"]
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
+                # A single chunk can have both thinking + content; emit thinking first.
+                for delta_text, btype in [
+                    (thinking_delta, "thinking"),
+                    (content_delta, "text"),
+                ]:
+                    if not delta_text:
+                        continue
+
+                    # Accumulate text
+                    if btype == "thinking":
+                        accumulated_thinking += delta_text
+                    else:
+                        accumulated_content += delta_text
+
+                    # Block transition (including first block)?
+                    if current_block_type != btype:
+                        # Close previously open block
+                        if current_block_type is not None:
+                            if hooks_available:
+                                await self.coordinator.hooks.emit(
+                                    "llm:stream_block_end",
+                                    {
+                                        "request_id": request_id,
+                                        "block_index": block_index,
+                                        "block_type": current_block_type,
+                                    },
+                                )
+                            block_index += 1
+
+                        # Open new block
+                        current_block_type = btype
+                        seq[block_index] = 0
+                        if hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_block_start",
+                                {
+                                    "request_id": request_id,
+                                    "block_index": block_index,
+                                    "block_type": btype,
+                                },
+                            )
+
+                    # Emit the delta — single event for all block content (contract §1)
+                    if hooks_available:
                         await self.coordinator.hooks.emit(
-                            "llm:stream:chunk",
-                            {"content": message["content"], "provider": "ollama"},
+                            "llm:stream_block_delta",
+                            {
+                                "request_id": request_id,
+                                "block_index": block_index,
+                                "block_type": btype,
+                                "sequence": seq[block_index],
+                                "text": delta_text,
+                            },
                         )
+                        partial_emitted = True
+                    seq[block_index] = seq.get(block_index, 0) + 1
 
-                # Handle thinking chunks
-                if message.get("thinking"):
-                    accumulated_thinking += message["thinking"]
-                    if self.coordinator and hasattr(self.coordinator, "hooks"):
-                        await self.coordinator.hooks.emit(
-                            "llm:stream:thinking",
-                            {"thinking": message["thinking"], "provider": "ollama"},
-                        )
-
-                # Accumulate tool calls from streaming chunks (supported since Ollama v0.8.0)
+                # Accumulate tool calls (streaming chunks; Ollama v0.8.0+)
                 if message.get("tool_calls"):
                     for tc in message["tool_calls"]:
                         accumulated_tool_calls.append(tc)
 
                 if chunk.get("done"):
+                    # Close the last open text/thinking block
+                    if current_block_type is not None:
+                        if hooks_available:
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_block_end",
+                                {
+                                    "request_id": request_id,
+                                    "block_index": block_index,
+                                    "block_type": current_block_type,
+                                },
+                            )
+                        block_index += 1
+                        current_block_type = None
+
+                    # Emit atomic tool_use blocks (block_start + block_end per call)
+                    if hooks_available:
+                        for tc in accumulated_tool_calls:
+                            function = (
+                                tc.get("function", {})
+                                if isinstance(tc, dict)
+                                else getattr(tc, "function", {})
+                            )
+                            tc_name = ""
+                            if isinstance(function, dict):
+                                tc_name = function.get("name", "")
+                            elif hasattr(function, "name"):
+                                tc_name = getattr(function, "name", "") or ""
+
+                            start_payload: dict[str, Any] = {
+                                "request_id": request_id,
+                                "block_index": block_index,
+                                "block_type": "tool_use",
+                            }
+                            if tc_name:
+                                start_payload["name"] = tc_name
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_block_start", start_payload
+                            )
+                            await self.coordinator.hooks.emit(
+                                "llm:stream_block_end",
+                                {
+                                    "request_id": request_id,
+                                    "block_index": block_index,
+                                    "block_type": "tool_use",
+                                },
+                            )
+                            block_index += 1
+
                     final_chunk = chunk
 
             elapsed_ms = int((time.time() - start_time) * 1000)
@@ -1249,7 +1351,7 @@ class OllamaProvider:
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.error(f"[PROVIDER] Streaming error: {e}")
 
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
+            if hooks_available:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
@@ -1263,13 +1365,21 @@ class OllamaProvider:
                         "stream": True,
                     },
                 )
+                if partial_emitted:
+                    await self.coordinator.hooks.emit(
+                        "llm:stream_aborted",
+                        {
+                            "request_id": request_id,
+                            "error": {"type": type(e).__name__, "msg": str(e)},
+                        },
+                    )
             raise
 
         except Exception as e:
             elapsed_ms = int((time.time() - start_time) * 1000)
             logger.error(f"[PROVIDER] Streaming error: {e}")
 
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
+            if hooks_available:
                 await self.coordinator.hooks.emit(
                     "llm:response",
                     {
@@ -1281,6 +1391,14 @@ class OllamaProvider:
                         "stream": True,
                     },
                 )
+                if partial_emitted:
+                    await self.coordinator.hooks.emit(
+                        "llm:stream_aborted",
+                        {
+                            "request_id": request_id,
+                            "error": {"type": type(e).__name__, "msg": str(e)},
+                        },
+                    )
             raise _translate_ollama_error(e) from e
 
     def _build_streaming_response(
