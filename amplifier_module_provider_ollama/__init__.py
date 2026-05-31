@@ -1228,18 +1228,14 @@ class OllamaProvider:
                                 },
                             )
 
-                    # Emit the delta
-                    event_name = (
-                        "llm:stream_thinking_delta"
-                        if btype == "thinking"
-                        else "llm:stream_block_delta"
-                    )
+                    # Emit the delta — single event for all block content (contract §1)
                     if hooks_available:
                         await self.coordinator.hooks.emit(
-                            event_name,
+                            "llm:stream_block_delta",
                             {
                                 "request_id": request_id,
                                 "block_index": block_index,
+                                "block_type": btype,
                                 "sequence": seq[block_index],
                                 "text": delta_text,
                             },

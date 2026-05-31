@@ -1,9 +1,12 @@
 """
 TDD tests for the Ollama provider streaming contract.
 
-Asserts the five-event contract defined in provider-streaming-contract.md:
-  llm:stream_block_start, llm:stream_block_delta, llm:stream_thinking_delta,
+Asserts the four-event contract defined in provider-streaming-contract.md:
+  llm:stream_block_start, llm:stream_block_delta (ALL content — text AND thinking),
   llm:stream_block_end, llm:stream_aborted.
+
+There is NO llm:stream_thinking_delta event; block_type ("text"|"thinking")
+  is carried on every llm:stream_block_delta payload instead.
 
 All assertions are against exact event names and required payload keys.
 """
@@ -205,9 +208,15 @@ async def test_thinking_then_text_produces_correct_event_sequence():
 
     # Must have all event types
     assert "llm:stream_block_start" in names
-    assert "llm:stream_thinking_delta" in names
-    assert "llm:stream_block_delta" in names
+    assert "llm:stream_block_delta" in names  # used for BOTH text and thinking
     assert "llm:stream_block_end" in names
+
+    # Thinking deltas must carry block_type=="thinking"
+    thinking_deltas = [
+        p for n, p in evts
+        if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"
+    ]
+    assert thinking_deltas, "Must emit at least one block_delta with block_type=='thinking'"
 
     # Extract the block_start and block_end events in order
     starts = [(n, p) for n, p in evts if n == "llm:stream_block_start"]
@@ -261,17 +270,17 @@ async def test_per_block_sequences_reset_at_block_boundary():
 
     evts = _stream_events(provider)
 
-    # thinking deltas (block_index=0)
+    # thinking deltas (block_index=0) — now all use llm:stream_block_delta
     thinking_seqs = [
         p["sequence"]
         for n, p in evts
-        if n == "llm:stream_thinking_delta"
+        if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"
     ]
     # text deltas (block_index=1)
     text_seqs = [
         p["sequence"]
         for n, p in evts
-        if n == "llm:stream_block_delta"
+        if n == "llm:stream_block_delta" and p.get("block_type") == "text"
     ]
 
     assert thinking_seqs == [0, 1, 2], f"thinking sequences wrong: {thinking_seqs}"
@@ -305,7 +314,7 @@ async def test_empty_fragments_not_emitted():
 
     deltas = [
         (n, p) for n, p in _stream_events(provider)
-        if n in ("llm:stream_block_delta", "llm:stream_thinking_delta")
+        if n == "llm:stream_block_delta"
     ]
     assert len(deltas) == 1, f"Only one non-empty delta expected, got {len(deltas)}: {deltas}"
     _, payload = deltas[0]
@@ -348,7 +357,7 @@ async def test_tool_calls_emitted_as_atomic_blocks():
     )
 
     # No delta events for tool calls
-    deltas = [n for n, _ in evts if n in ("llm:stream_block_delta", "llm:stream_thinking_delta")]
+    deltas = [n for n, _ in evts if n == "llm:stream_block_delta"]
     assert deltas == [], f"tool_use blocks must not emit deltas, got {deltas}"
 
 
@@ -422,19 +431,25 @@ async def test_block_delta_payload_shape():
     for _, payload in deltas:
         assert "request_id" in payload, f"block_delta missing request_id: {payload}"
         assert "block_index" in payload, f"block_delta missing block_index: {payload}"
+        assert "block_type" in payload, f"block_delta missing block_type: {payload}"
+        assert payload["block_type"] in ("text", "thinking"), (
+            f"block_delta block_type must be 'text' or 'thinking': {payload}"
+        )
         assert "sequence" in payload, f"block_delta missing sequence: {payload}"
         assert "text" in payload, f"block_delta missing text: {payload}"
         assert payload["text"], f"block_delta must not have empty text: {payload}"
 
 
 # ---------------------------------------------------------------------------
-# Test 11: thinking_delta payload shape
+# Test 11: thinking block_delta payload shape
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_thinking_delta_payload_shape():
-    """Each llm:stream_thinking_delta must have: request_id, block_index, sequence, text."""
+async def test_thinking_block_delta_payload_shape():
+    """Thinking fragments use llm:stream_block_delta with block_type=='thinking'.
+    Must carry: request_id, block_index, block_type, sequence, text.
+    There is NO llm:stream_thinking_delta event."""
     provider = _make_provider()
     provider.client.chat = AsyncMock(
         return_value=_thinking_then_text_stream(["think1"], ["text1"])
@@ -442,18 +457,34 @@ async def test_thinking_delta_payload_shape():
 
     await provider.complete(_request())
 
-    thinking_deltas = [
-        (n, p) for n, p in _stream_events(provider)
+    # Must NOT emit llm:stream_thinking_delta
+    thinking_delta_names = [
+        n for n, _ in _stream_events(provider)
         if n == "llm:stream_thinking_delta"
     ]
-    assert thinking_deltas, "Must emit at least one thinking_delta for thinking stream"
+    assert thinking_delta_names == [], (
+        f"llm:stream_thinking_delta must NOT be emitted (use block_delta with block_type='thinking'): {thinking_delta_names}"
+    )
+
+    # Thinking content must arrive via llm:stream_block_delta with block_type=="thinking"
+    thinking_deltas = [
+        (n, p) for n, p in _stream_events(provider)
+        if n == "llm:stream_block_delta" and p.get("block_type") == "thinking"
+    ]
+    assert thinking_deltas, (
+        "Must emit at least one llm:stream_block_delta with block_type=='thinking' for a thinking stream"
+    )
 
     for _, payload in thinking_deltas:
-        assert "request_id" in payload
-        assert "block_index" in payload
-        assert "sequence" in payload
-        assert "text" in payload
-        assert payload["text"], f"thinking_delta must not have empty text: {payload}"
+        assert "request_id" in payload, f"thinking block_delta missing request_id: {payload}"
+        assert "block_index" in payload, f"thinking block_delta missing block_index: {payload}"
+        assert "block_type" in payload, f"thinking block_delta missing block_type: {payload}"
+        assert payload["block_type"] == "thinking", (
+            f"thinking block_delta must have block_type=='thinking': {payload}"
+        )
+        assert "sequence" in payload, f"thinking block_delta missing sequence: {payload}"
+        assert "text" in payload, f"thinking block_delta missing text: {payload}"
+        assert payload["text"], f"thinking block_delta must not have empty text: {payload}"
 
 
 # ---------------------------------------------------------------------------
