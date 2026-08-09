@@ -890,10 +890,16 @@ class OllamaProvider:
                 if chat_response.usage:
                     event_usage["input_tokens"] = chat_response.usage.input_tokens
                     event_usage["output_tokens"] = chat_response.usage.output_tokens
-                    if chat_response.usage.cache_read_tokens is not None:
-                        event_usage["cache_read_tokens"] = (
-                            chat_response.usage.cache_read_tokens
-                        )
+                    # No cache_read_tokens key here: Ollama's ChatResponse (and
+                    # the underlying BaseGenerateResponse, verified against the
+                    # installed `ollama` SDK 0.6.1) reports only
+                    # prompt_eval_count/prompt_eval_duration and
+                    # eval_count/eval_duration -- no field distinguishing
+                    # KV-cache-reused prompt tokens from freshly evaluated ones.
+                    # `Usage.cache_read_tokens` is therefore never set (see
+                    # _convert_to_chat_response below) and always None, so a
+                    # conditional here would be permanently dead. See
+                    # tests/test_cache_read_tokens_not_fabricated.py.
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
                     event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
 
@@ -1318,10 +1324,16 @@ class OllamaProvider:
                 if chat_response.usage:
                     event_usage["input_tokens"] = chat_response.usage.input_tokens
                     event_usage["output_tokens"] = chat_response.usage.output_tokens
-                    if chat_response.usage.cache_read_tokens is not None:
-                        event_usage["cache_read_tokens"] = (
-                            chat_response.usage.cache_read_tokens
-                        )
+                    # No cache_read_tokens key here: Ollama's ChatResponse (and
+                    # the underlying BaseGenerateResponse, verified against the
+                    # installed `ollama` SDK 0.6.1) reports only
+                    # prompt_eval_count/prompt_eval_duration and
+                    # eval_count/eval_duration -- no field distinguishing
+                    # KV-cache-reused prompt tokens from freshly evaluated ones.
+                    # `Usage.cache_read_tokens` is therefore never set (see
+                    # _build_streaming_response below) and always None, so a
+                    # conditional here would be permanently dead. See
+                    # tests/test_cache_read_tokens_not_fabricated.py.
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
                     event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
 
@@ -1479,6 +1491,20 @@ class OllamaProvider:
         # NOTE: reasoning_tokens is always None for Ollama because eval_count
         # includes both reasoning and visible output tokens — Ollama does not
         # report them separately.
+        #
+        # NOTE: cache_read_tokens (and cache_write_tokens) are also always
+        # None. Verified against the installed `ollama` SDK's actual response
+        # type (`ollama._types.BaseGenerateResponse`, SDK 0.6.1), which
+        # exposes only: model, created_at, done, done_reason, total_duration,
+        # load_duration, prompt_eval_count, prompt_eval_duration, eval_count,
+        # eval_duration. Ollama does reuse the model's KV cache locally across
+        # requests with a shared prompt prefix (a process-internal
+        # implementation detail of the underlying llama.cpp runtime), but the
+        # chat API response never reports how many prompt tokens were served
+        # from that reuse versus freshly evaluated — there is no field to
+        # read a real number from. Per the no-fabrication rule, these fields
+        # must stay unset (Usage's None default) rather than be inferred from
+        # prompt_eval_count deltas across calls or any other derived guess.
         usage = Usage(
             input_tokens=final_chunk.get("prompt_eval_count", 0) if final_chunk else 0,
             output_tokens=final_chunk.get("eval_count", 0) if final_chunk else 0,
@@ -1490,6 +1516,7 @@ class OllamaProvider:
                 if final_chunk
                 else 0
             ),
+            # cache_read_tokens / cache_write_tokens intentionally omitted — see NOTE above.
         )
 
         # Stamp cost_usd — Ollama is self-hosted so cost is always indeterminate (None).
@@ -1933,11 +1960,26 @@ class OllamaProvider:
         # NOTE: reasoning_tokens is always None for Ollama because eval_count
         # includes both reasoning and visible output tokens — Ollama does not
         # report them separately.
+        #
+        # NOTE: cache_read_tokens (and cache_write_tokens) are also always
+        # None. Verified against the installed `ollama` SDK's actual response
+        # type (`ollama._types.BaseGenerateResponse`, SDK 0.6.1), which
+        # exposes only: model, created_at, done, done_reason, total_duration,
+        # load_duration, prompt_eval_count, prompt_eval_duration, eval_count,
+        # eval_duration. Ollama does reuse the model's KV cache locally across
+        # requests with a shared prompt prefix (a process-internal
+        # implementation detail of the underlying llama.cpp runtime), but the
+        # chat API response never reports how many prompt tokens were served
+        # from that reuse versus freshly evaluated — there is no field to
+        # read a real number from. Per the no-fabrication rule, these fields
+        # must stay unset (Usage's None default) rather than be inferred from
+        # prompt_eval_count deltas across calls or any other derived guess.
         usage = Usage(
             input_tokens=response.get("prompt_eval_count", 0),
             output_tokens=response.get("eval_count", 0),
             total_tokens=response.get("prompt_eval_count", 0)
             + response.get("eval_count", 0),
+            # cache_read_tokens / cache_write_tokens intentionally omitted — see NOTE above.
         )
 
         # Stamp cost_usd — Ollama is self-hosted so cost is always indeterminate (None).
