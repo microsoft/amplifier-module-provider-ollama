@@ -83,9 +83,9 @@ class OllamaChatResponse(ChatResponse):
 def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[reportReturnType]
     """Translate native Ollama/connection errors to kernel LLM error types.
 
-    Called inside _do_complete() / _do_stream_connect() so that
-    retry_with_backoff sees LLMError subclasses and can check .retryable
-    to decide whether to retry.
+    Called inside _do_complete() / _do_stream_connect() / _do_list_models()
+    so that retry_with_backoff sees LLMError subclasses and can check
+    .retryable to decide whether to retry.
     5xx errors become ProviderUnavailableError(retryable=True), while
     4xx errors become non-retryable errors that raise immediately.
 
@@ -495,13 +495,62 @@ class OllamaProvider:
         """
         List available models from local Ollama server.
 
-        Queries the Ollama API to get list of installed models.
-        Returns empty list if server is unreachable (allows wizard to fall back to manual input).
+        The query is retried with the same shared retry_with_backoff()/
+        _retry_config machinery used by complete(), reusing this module's
+        own _translate_ollama_error() classification (retryable connection
+        errors, timeouts, and 5xx; non-retryable 401/403/404/400).
+
+        Unlike complete(), list_models() never raises to the caller -- this
+        preserves the existing soft-failure contract (the setup wizard and
+        the model-role/glob resolver both treat [] as "no models available"
+        and degrade accordingly). Once retries are exhausted -- or
+        immediately, for a non-retryable error -- a WARNING is logged
+        naming the attempt count and the degraded fallback before falling
+        back to an empty list, so the degradation is loud in logs even
+        though it stays silent to the caller.
         """
+        attempt_count = 0
+
+        async def _do_list_models():
+            nonlocal attempt_count
+            attempt_count += 1
+            try:
+                return await self.client.list()
+            except LLMError:
+                raise  # Already translated, don't double-wrap
+            except Exception as e:
+                raise _translate_ollama_error(e) from e
+
+        # Callback for retry events -- signature matches amplifier-core's
+        # retry_with_backoff on_retry contract: (attempt, delay, error)
+        async def _on_retry(attempt: int, delay: float, error: LLMError) -> None:
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:retry",
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+
         try:
-            response = await self.client.list()
-        except (ConnectionError, OSError, TimeoutError) as e:
-            logger.warning("Could not connect to Ollama server: %s", e)
+            response = await retry_with_backoff(
+                _do_list_models, self._retry_config, on_retry=_on_retry
+            )
+        except LLMError as e:
+            logger.warning(
+                "[PROVIDER] list_models() failed after %d attempt(s) "
+                "(max_retries=%d): %s. Falling back to a DEGRADED EMPTY "
+                "model list -- model role/glob resolution may silently "
+                "resolve to no candidates.",
+                attempt_count,
+                self._retry_config.max_retries,
+                e,
+            )
             return []
         models = []
         # response.models is a list of Model objects with .model attribute (not .name)
