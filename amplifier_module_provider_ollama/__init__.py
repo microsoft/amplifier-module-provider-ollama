@@ -160,10 +160,21 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
     # Single source of truth: the `host` URL drives all downstream decisions
     # (cloud-vs-local detection, default_model, capabilities, skip-pull).
-    # Legacy configs containing a `mode` key are silently ignored — `mode`
-    # was removed in favor of host-based derivation. To run a mix of local
+    # Legacy configs containing a `mode` key are ignored — `mode` was
+    # removed in favor of host-based derivation. To run a mix of local
     # + cloud, configure two provider instances with different `instance_id`
     # values (see README).
+    if "mode" in config:
+        logger.warning(
+            "[PROVIDER] Config key 'mode'=%r is ignored: it was removed in "
+            "favor of host-based derivation (the 'host' URL is now the "
+            "single source of truth for local-vs-cloud detection). Remove "
+            "'mode' from your config. To run a mix of local + cloud "
+            "simultaneously, configure two provider instances with "
+            "different 'instance_id' values instead (see README).",
+            config["mode"],
+        )
+
     host = config.get("host") or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     api_key = config.get("api_key") or os.environ.get("OLLAMA_API_KEY")
 
