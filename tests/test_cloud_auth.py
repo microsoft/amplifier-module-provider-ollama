@@ -326,11 +326,18 @@ def test_get_info_api_key_field_gated_by_host_pattern():
     assert field.show_when == {"host": "contains:ollama.com"}
 
 
-def test_get_info_auto_pull_field_gated_by_host_pattern():
+def test_get_info_auto_pull_is_settings_only_not_wizard_prompted():
+    """auto_pull is a fully supported config key but is no longer surfaced
+    by the setup wizard (config_fields) -- the wizard was slimmed to only
+    prompt for the connection essentials (host, api_key). Tuning knobs like
+    auto_pull remain settable directly via settings.yaml (see README)."""
     info = OllamaProvider(host="http://localhost:11434").get_info()
     auto_pull_fields = [f for f in info.config_fields if f.id == "auto_pull"]
-    assert len(auto_pull_fields) == 1
-    assert auto_pull_fields[0].show_when == {"host": "not_contains:ollama.com"}
+    assert len(auto_pull_fields) == 0
+    provider = OllamaProvider(
+        host="http://localhost:11434", config={"auto_pull": "true"}
+    )
+    assert provider.auto_pull is True
 
 
 # ---------- Capability tagging tracks is_cloud (URL-derived) ----------
