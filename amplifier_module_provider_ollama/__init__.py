@@ -7,6 +7,7 @@ Integrates with local Ollama server for LLM completions.
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import difflib
 import logging
 import os
 import time
@@ -49,6 +50,155 @@ logger = logging.getLogger(__name__)
 
 # Unified default context length used when model metadata is unavailable
 DEFAULT_CONTEXT_LENGTH = 8192
+
+# Config keys this provider actively reads. Used by _warn_unknown_config_keys()
+# below to warn (never fail) on typos/removed keys. `priority` is read by the
+# orchestrator's provider-selection logic (attribute-then-config), and
+# `extra_request_params` is app-cli-reserved -- both must stay allow-listed so
+# users are never told to delete live settings.
+_KNOWN_CONFIG_KEYS = frozenset(
+    {
+        "host",
+        "api_key",
+        "default_model",
+        "max_tokens",
+        "temperature",
+        "timeout",
+        "auto_pull",
+        "num_ctx",
+        "enable_thinking",
+        "thinking_effort",
+        "top_p",
+        "top_k",
+        "min_p",
+        "repeat_penalty",
+        "seed",
+        "stop",
+        "keep_alive",
+        "logprobs",
+        "top_logprobs",
+        "max_retries",
+        "min_retry_delay",
+        "max_retry_delay",
+        "retry_jitter",
+        "use_streaming",
+        "raw",
+        "instance_id",
+        "priority",
+        "extra_request_params",
+    }
+)
+
+# Targeted messages for keys that used to do something (or were documented
+# but never wired) and now have a known migration path. These take priority
+# over the generic did-you-mean warning below.
+_INERT_CONFIG_KEY_MESSAGES = {
+    "mode": (
+        "Config key 'mode' is ignored: it was removed in favor of "
+        "host-based derivation ('host' is now the single source of truth "
+        "for local-vs-cloud detection). Remove 'mode' from your config. "
+        "To run a mix of local + cloud simultaneously, configure two "
+        "provider instances with different 'instance_id' values instead "
+        "(see README)."
+    ),
+    "debug": (
+        "Config key 'debug' is no longer read by this provider -- there is "
+        "no standard-debug event path here. Remove it from your config."
+    ),
+    "raw_debug": (
+        "Config key 'raw_debug' is no longer read by this provider. Use "
+        "'raw: true' instead -- it attaches the exact request params sent "
+        "to Ollama to the 'llm:request' event's 'raw' field."
+    ),
+}
+
+
+def _warn_unknown_config_keys(config: dict[str, Any]) -> None:
+    """Warn (never fail) about config keys this provider doesn't recognize.
+
+    Ghost keys with a known migration path get a targeted message from
+    _INERT_CONFIG_KEY_MESSAGES; anything else gets a difflib did-you-mean
+    suggestion against the known key set.
+    """
+    for key in config:
+        if key in _KNOWN_CONFIG_KEYS:
+            continue
+        if key in _INERT_CONFIG_KEY_MESSAGES:
+            logger.warning("[PROVIDER] %s", _INERT_CONFIG_KEY_MESSAGES[key])
+            continue
+        suggestions = difflib.get_close_matches(key, _KNOWN_CONFIG_KEYS, n=1)
+        hint = f" Did you mean '{suggestions[0]}'?" if suggestions else ""
+        logger.warning("[PROVIDER] Unknown config key '%s' is ignored.%s", key, hint)
+
+
+def _coerce_bool(value: Any, *, key: str, default: bool) -> bool:
+    """Coerce a config value to bool, tolerating string forms from wizards.
+
+    Config wizards commonly persist booleans as the strings "true"/"false".
+    ``bool("false")`` evaluates to ``True`` in Python, silently inverting the
+    user's intent -- this parses the string content instead of relying on
+    Python truthiness.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes"):
+            return True
+        if normalized in ("false", "0", "no"):
+            return False
+        logger.warning(
+            "[PROVIDER] Config key '%s' has unrecognized boolean value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+    logger.warning(
+        "[PROVIDER] Config key '%s' has unexpected type %s for a boolean "
+        "value (%r); coercing with bool().",
+        key,
+        type(value).__name__,
+        value,
+    )
+    return bool(value)
+
+
+def _coerce_int(value: Any, *, key: str, default: int) -> int:
+    """Coerce a config value to int, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid integer value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
+
+
+def _coerce_float(value: Any, *, key: str, default: float) -> float:
+    """Coerce a config value to float, warning and defaulting on failure."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[PROVIDER] Config key '%s' has invalid float value %r; "
+            "defaulting to %s.",
+            key,
+            value,
+            default,
+        )
+        return default
 
 
 def _is_cloud_host(host: str | None) -> bool:
@@ -163,17 +313,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     # Legacy configs containing a `mode` key are ignored — `mode` was
     # removed in favor of host-based derivation. To run a mix of local
     # + cloud, configure two provider instances with different `instance_id`
-    # values (see README).
-    if "mode" in config:
-        logger.warning(
-            "[PROVIDER] Config key 'mode'=%r is ignored: it was removed in "
-            "favor of host-based derivation (the 'host' URL is now the "
-            "single source of truth for local-vs-cloud detection). Remove "
-            "'mode' from your config. To run a mix of local + cloud "
-            "simultaneously, configure two provider instances with "
-            "different 'instance_id' values instead (see README).",
-            config["mode"],
-        )
+    # values (see README). Unknown/ghost keys (incl. `mode`) are handled by
+    # the sweep below.
+    _warn_unknown_config_keys(config)
 
     host = config.get("host") or os.environ.get("OLLAMA_HOST", "http://localhost:11434")
     api_key = config.get("api_key") or os.environ.get("OLLAMA_API_KEY")
@@ -271,20 +413,47 @@ class OllamaProvider:
             CLOUD_DEFAULT_MODEL if self._is_cloud_cached else LOCAL_DEFAULT_MODEL
         )
         self.default_model = self.config.get("default_model", _host_default)
-        self.max_tokens = self.config.get("max_tokens", 4096)
-        self.temperature = self.config.get("temperature", 0.7)
-        self.timeout = float(
-            self.config.get("timeout", 600.0)
-        )  # API timeout in seconds (default 10 min - local models need longer for prefill)
-        self.auto_pull = self.config.get("auto_pull", False)
-        self.raw = self.config.get("raw", False)
+        self.max_tokens = _coerce_int(
+            self.config.get("max_tokens"), key="max_tokens", default=4096
+        )
+        self.temperature = _coerce_float(
+            self.config.get("temperature"), key="temperature", default=0.7
+        )
+        # API timeout in seconds (default 10 min - local models need longer for prefill)
+        self.timeout = _coerce_float(
+            self.config.get("timeout"), key="timeout", default=600.0
+        )
+        # NOTE: config wizards persist booleans as the strings "true"/"false".
+        # bool("false") is True in Python -- _coerce_bool parses the string
+        # content instead of relying on truthiness (this was a live bug:
+        # every wizard-configured auto_pull=false was silently treated as
+        # auto_pull=True).
+        self.auto_pull = _coerce_bool(
+            self.config.get("auto_pull"), key="auto_pull", default=False
+        )
+        self.raw = _coerce_bool(self.config.get("raw"), key="raw", default=False)
         # Context window size (num_ctx in ollama) - 0 means auto-detect from model
-        self.num_ctx = int(self.config.get("num_ctx", 0))
+        self.num_ctx = _coerce_int(self.config.get("num_ctx"), key="num_ctx", default=0)
         # Cache for model context lengths (avoid repeated API calls)
         self._model_ctx_cache: dict[str, int] = {}
         # Enable thinking/reasoning for models that support it (default: True)
         # Models that don't support thinking will simply ignore this option
-        self.enable_thinking = self.config.get("enable_thinking", True)
+        self.enable_thinking = _coerce_bool(
+            self.config.get("enable_thinking"), key="enable_thinking", default=True
+        )
+        # Arbitrary Ollama-native options merged in last (after every other
+        # option is computed) -- an escape hatch for options this provider
+        # doesn't expose a dedicated field for (e.g. mirostat,
+        # repeat_last_n). See _build_options().
+        _extra_raw = self.config.get("extra_request_params")
+        if _extra_raw is not None and not isinstance(_extra_raw, dict):
+            logger.warning(
+                "[PROVIDER] Config key 'extra_request_params' must be a "
+                "dict; got %s. Ignoring.",
+                type(_extra_raw).__name__,
+            )
+            _extra_raw = None
+        self.extra_request_params: dict[str, Any] = _extra_raw or {}
         # Thinking effort level: None (boolean True), or "high"/"medium"/"low"
         self.thinking_effort: str | None = self.config.get("thinking_effort")
 
@@ -325,10 +494,18 @@ class OllamaProvider:
 
         # Retry configuration using amplifier-core's RetryConfig
         self._retry_config = RetryConfig(
-            max_retries=int(self.config.get("max_retries", 3)),
-            initial_delay=float(self.config.get("min_retry_delay", 1.0)),
-            max_delay=float(self.config.get("max_retry_delay", 60.0)),
-            jitter=bool(self.config.get("retry_jitter", True)),
+            max_retries=_coerce_int(
+                self.config.get("max_retries"), key="max_retries", default=3
+            ),
+            initial_delay=_coerce_float(
+                self.config.get("min_retry_delay"), key="min_retry_delay", default=1.0
+            ),
+            max_delay=_coerce_float(
+                self.config.get("max_retry_delay"), key="max_retry_delay", default=60.0
+            ),
+            jitter=_coerce_bool(
+                self.config.get("retry_jitter"), key="retry_jitter", default=True
+            ),
         )
 
     @property
@@ -398,49 +575,12 @@ class OllamaProvider:
                     required=False,
                     show_when={"host": "contains:ollama.com"},
                 ),
-                # auto_pull — Ollama Cloud doesn't support `ollama pull`, so
-                # only prompt for non-cloud hosts. Runtime code skips pull()
-                # for cloud regardless (defense in depth).
-                ConfigField(
-                    id="auto_pull",
-                    display_name="Auto-Pull Models",
-                    field_type="boolean",
-                    prompt="Automatically pull missing models?",
-                    default="false",
-                    required=False,
-                    show_when={"host": "not_contains:ollama.com"},
-                ),
-                ConfigField(
-                    id="enable_thinking",
-                    display_name="Enable Thinking",
-                    field_type="boolean",
-                    prompt="Enable thinking/reasoning for supported models?",
-                    required=False,
-                    default="true",
-                ),
-                ConfigField(
-                    id="keep_alive",
-                    display_name="Keep Alive",
-                    field_type="text",
-                    prompt="Model keep-alive duration (e.g., '5m', '-1' for indefinite)",
-                    required=False,
-                ),
-                ConfigField(
-                    id="num_ctx",
-                    display_name="Context Window Override",
-                    field_type="text",
-                    prompt="Context window size override (0 = auto-detect from model)",
-                    required=False,
-                    default="0",
-                ),
-                ConfigField(
-                    id="timeout",
-                    display_name="Request Timeout",
-                    field_type="text",
-                    prompt="API request timeout in seconds (large models need longer for prefill)",
-                    required=False,
-                    default="600",
-                ),
+                # NOTE: auto_pull, enable_thinking, keep_alive, num_ctx, and
+                # timeout are all still fully supported config keys (see
+                # README) -- they are just no longer prompted by the setup
+                # wizard, which now only asks for the two connection
+                # essentials (host, api_key). Set the others directly in
+                # settings.yaml / the providers config block when needed.
             ],
         )
 
@@ -699,12 +839,69 @@ class OllamaProvider:
         # Streaming is the default; opt out via request.metadata["stream"] is False
         # (identity check, not truthiness) or config use_streaming=False.
         _meta = getattr(request, "metadata", None)
-        _use_streaming = self.config.get("use_streaming", True)
+        _use_streaming = _coerce_bool(
+            self.config.get("use_streaming"), key="use_streaming", default=True
+        )
         if isinstance(_meta, dict) and _meta.get("stream") is False:
             _use_streaming = False
         if _use_streaming:
             return await self._complete_streaming(request, **kwargs)
         return await self._complete_chat_request(request, **kwargs)
+
+    async def _build_options(
+        self, model: str, request: ChatRequest, kwargs: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build the Ollama ``options`` dict (3-tier precedence: request ->
+        kwargs -> instance default). Shared by both the streaming and
+        non-streaming completion paths so the two never drift.
+
+        ``extra_request_params`` is merged in LAST, so it can supply any
+        additional Ollama-native option this provider doesn't expose a
+        dedicated field for (e.g. ``mirostat``, ``repeat_last_n``) without
+        waiting on a new ConfigField -- and can override any computed
+        default above it if the caller wants that.
+        """
+        options: dict[str, Any] = {
+            "temperature": request.temperature
+            or kwargs.get("temperature", self.temperature),
+            "num_predict": request.max_output_tokens
+            or kwargs.get("max_tokens", self.max_tokens),
+        }
+
+        # Sampling parameters - only include when explicitly set
+        if (top_p := kwargs.get("top_p", self.top_p)) is not None:
+            options["top_p"] = top_p
+        if (top_k := kwargs.get("top_k", self.top_k)) is not None:
+            options["top_k"] = top_k
+        if (min_p := kwargs.get("min_p", self.min_p)) is not None:
+            options["min_p"] = min_p
+        if (
+            repeat_penalty := kwargs.get("repeat_penalty", self.repeat_penalty)
+        ) is not None:
+            options["repeat_penalty"] = repeat_penalty
+        if (seed := kwargs.get("seed", self.seed)) is not None:
+            options["seed"] = seed
+
+        # Stop sequences - `stop` is a Modelfile/options parameter per the
+        # Ollama API docs (docs/api.md: "options: additional model
+        # parameters listed in the documentation for the Modelfile"; the
+        # "Generate request (With options)" example nests `"stop": [...]`
+        # inside `options`). It is NOT a top-level /api/chat or /api/generate
+        # parameter.
+        if (stop := kwargs.get("stop", self.stop)) is not None:
+            options["stop"] = stop
+
+        # Set context window size (num_ctx controls how much context ollama uses)
+        # If num_ctx is configured, use it; otherwise auto-detect from model
+        if self.num_ctx > 0:
+            options["num_ctx"] = self.num_ctx
+        else:
+            options["num_ctx"] = await self._get_model_context_length(model)
+
+        if self.extra_request_params:
+            options.update(self.extra_request_params)
+
+        return options
 
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
@@ -785,45 +982,13 @@ class OllamaProvider:
         if self.auto_pull:
             await self._ensure_model_available(model)
 
-        # Build options dict with 3-tier precedence: request -> kwargs -> instance default
-        options: dict[str, Any] = {
-            "temperature": request.temperature
-            or kwargs.get("temperature", self.temperature),
-            "num_predict": request.max_output_tokens
-            or kwargs.get("max_tokens", self.max_tokens),
-        }
-
-        # Sampling parameters - only include when explicitly set
-        if (top_p := kwargs.get("top_p", self.top_p)) is not None:
-            options["top_p"] = top_p
-        if (top_k := kwargs.get("top_k", self.top_k)) is not None:
-            options["top_k"] = top_k
-        if (min_p := kwargs.get("min_p", self.min_p)) is not None:
-            options["min_p"] = min_p
-        if (
-            repeat_penalty := kwargs.get("repeat_penalty", self.repeat_penalty)
-        ) is not None:
-            options["repeat_penalty"] = repeat_penalty
-        if (seed := kwargs.get("seed", self.seed)) is not None:
-            options["seed"] = seed
-
-        # Set context window size (num_ctx controls how much context ollama uses)
-        # If num_ctx is configured, use it; otherwise auto-detect from model
-        if self.num_ctx > 0:
-            options["num_ctx"] = self.num_ctx
-        else:
-            ctx_length = await self._get_model_context_length(model)
-            options["num_ctx"] = ctx_length
+        options = await self._build_options(model, request, kwargs)
 
         params: dict[str, Any] = {
             "model": model,
             "messages": ollama_messages,
             "options": options,
         }
-
-        # Stop sequences - top-level param for Ollama SDK
-        if (stop := kwargs.get("stop", self.stop)) is not None:
-            params["stop"] = stop
 
         # Keep model loaded in memory
         if self.keep_alive is not None:
@@ -1091,34 +1256,7 @@ class OllamaProvider:
         if self.auto_pull:
             await self._ensure_model_available(model)
 
-        # Build options dict with 3-tier precedence: request -> kwargs -> instance default
-        options: dict[str, Any] = {
-            "temperature": request.temperature
-            or kwargs.get("temperature", self.temperature),
-            "num_predict": request.max_output_tokens
-            or kwargs.get("max_tokens", self.max_tokens),
-        }
-
-        # Sampling parameters - only include when explicitly set
-        if (top_p := kwargs.get("top_p", self.top_p)) is not None:
-            options["top_p"] = top_p
-        if (top_k := kwargs.get("top_k", self.top_k)) is not None:
-            options["top_k"] = top_k
-        if (min_p := kwargs.get("min_p", self.min_p)) is not None:
-            options["min_p"] = min_p
-        if (
-            repeat_penalty := kwargs.get("repeat_penalty", self.repeat_penalty)
-        ) is not None:
-            options["repeat_penalty"] = repeat_penalty
-        if (seed := kwargs.get("seed", self.seed)) is not None:
-            options["seed"] = seed
-
-        # Set context window size (num_ctx controls how much context ollama uses)
-        if self.num_ctx > 0:
-            options["num_ctx"] = self.num_ctx
-        else:
-            ctx_length = await self._get_model_context_length(model)
-            options["num_ctx"] = ctx_length
+        options = await self._build_options(model, request, kwargs)
 
         params: dict[str, Any] = {
             "model": model,
@@ -1126,10 +1264,6 @@ class OllamaProvider:
             "options": options,
             "stream": True,
         }
-
-        # Stop sequences - top-level param for Ollama SDK
-        if (stop := kwargs.get("stop", self.stop)) is not None:
-            params["stop"] = stop
 
         # Keep model loaded in memory
         if self.keep_alive is not None:

@@ -33,34 +33,41 @@ deployment.
     "timeout": 600,                    # Request timeout (seconds; 10 min default)
     "auto_pull": False,                # Auto-pull missing models (local only;
                                        # silently ignored for Ollama Cloud).
-    "debug": False,                    # Enable standard debug events
-    "raw_debug": False,                # Enable ultra-verbose raw API I/O logging
 }
 ```
 
-### Debug Configuration
+### All config keys
 
-**Standard Debug** (`debug: true`):
-- Emits `llm:request:debug` and `llm:response:debug` events
-- Contains request/response summaries with message counts, model info, usage stats
-- Long values automatically truncated for readability
-- Moderate log volume, suitable for development
+Only `host` and `api_key` are prompted by the setup wizard (they're the
+connection essentials). Every key below is a fully supported config key --
+set it directly in `settings.yaml` / the provider's `config:` block.
 
-**Raw Debug** (`debug: true, raw_debug: true`):
-- Emits `llm:request:raw` and `llm:response:raw` events
-- Contains complete, unmodified request params and response objects
-- Extreme log volume, use only for deep provider integration debugging
-- Captures the exact data sent to/from Ollama API before any processing
+| Key | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `host` | string | `http://localhost:11434` | Single source of truth for local-vs-cloud (see above) |
+| `api_key` | string | `None` | Ollama Cloud / auth-proxy Bearer token |
+| `default_model` | string | host-derived | `gpt-oss:120b` (cloud) / `llama3.2:3b` (local) |
+| `max_tokens` | int | `4096` | Maps to `num_predict` |
+| `temperature` | float | `0.7` | |
+| `timeout` | float (seconds) | `600` | Request timeout |
+| `auto_pull` | bool | `False` | Auto-pull missing models (local only) |
+| `enable_thinking` | bool | `True` | Enable thinking/reasoning for supported models |
+| `thinking_effort` | string | `None` | `"low"`/`"medium"`/`"high"` |
+| `keep_alive` | string | `None` | e.g. `"5m"`, `"-1"` for indefinite |
+| `num_ctx` | int | `0` (auto-detect) | Context window override |
+| `top_p`, `top_k`, `min_p`, `repeat_penalty`, `seed`, `stop` | various | unset | Forwarded to Ollama's `options` only when explicitly set |
+| `logprobs`, `top_logprobs` | bool / int | unset | Requires Ollama >= 0.12.11 |
+| `max_retries`, `min_retry_delay`, `max_retry_delay`, `retry_jitter` | various | `3` / `1.0` / `60.0` / `True` | Client-side retry policy |
+| `use_streaming` | bool | `True` | Set `False` to force non-streaming completions |
+| `raw` | bool | `False` | Attach exact request params to the `llm:request` event |
+| `extra_request_params` | dict | `{}` | Merged last into Ollama's `options` -- an escape hatch for any Ollama-native option not listed above (e.g. `mirostat`, `repeat_last_n`) |
+| `priority` | int | n/a | Read by the orchestrator's provider-selection logic, not by this module directly |
 
-**Example**:
-```yaml
-providers:
-  - module: provider-ollama
-    config:
-      debug: true      # Enable debug events
-      raw_debug: true  # Enable raw API I/O capture
-      default_model: llama3.2:3b
-```
+Boolean and numeric keys accept native types (`true`/`false`, `123`) or the
+string forms a config wizard writes (`"true"`/`"false"`); invalid numeric
+strings warn and fall back to the default rather than crashing at mount.
+Unrecognized config keys produce a mount-time warning (with a did-you-mean
+suggestion) rather than a silent no-op or a crash.
 
 ## Usage
 
