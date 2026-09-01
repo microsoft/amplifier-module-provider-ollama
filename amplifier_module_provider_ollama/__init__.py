@@ -1022,9 +1022,21 @@ class OllamaProvider:
         include_thinking = False
         model_caps = self._detect_model_capabilities(model)
         if "thinking" in model_caps:
-            if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
-                params["think"] = self.thinking_effort or True
-                include_thinking = True
+            # getattr (not hasattr + attribute access) so the tri-state read
+            # happens exactly once: unset -> None -> falls through below;
+            # explicitly True/False -> handled here, including the off case.
+            requested_thinking = getattr(request, "enable_thinking", None)  # pyright: ignore[reportAttributeAccessIssue]
+            if requested_thinking is not None:
+                if requested_thinking:
+                    params["think"] = self.thinking_effort or True
+                    include_thinking = True
+                else:
+                    # Explicit opt-out MUST reach Ollama as `think: false` --
+                    # omitting the key is NOT equivalent to disabling thinking.
+                    # Ollama defaults thinking-capable models (e.g. qwen3) to
+                    # thinking ON, so a caller that asks for it off and is met
+                    # with silence pays full chain-of-thought latency anyway.
+                    params["think"] = False
             elif request.reasoning_effort is not None:
                 # Ollama v0.9.0+ supports effort levels ("high", "medium", "low")
                 # via the `think` parameter — pass through directly.
@@ -1126,7 +1138,9 @@ class OllamaProvider:
                     # conditional here would be permanently dead. See
                     # tests/test_cache_read_tokens_not_fabricated.py.
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
+                    event_usage["cost_usd"] = (
+                        str(_cost_usd) if _cost_usd is not None else None
+                    )
 
                 response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -1294,9 +1308,21 @@ class OllamaProvider:
         include_thinking = False
         model_caps = self._detect_model_capabilities(model)
         if "thinking" in model_caps:
-            if hasattr(request, "enable_thinking") and request.enable_thinking:  # pyright: ignore[reportAttributeAccessIssue]
-                params["think"] = self.thinking_effort or True
-                include_thinking = True
+            # getattr (not hasattr + attribute access) so the tri-state read
+            # happens exactly once: unset -> None -> falls through below;
+            # explicitly True/False -> handled here, including the off case.
+            requested_thinking = getattr(request, "enable_thinking", None)  # pyright: ignore[reportAttributeAccessIssue]
+            if requested_thinking is not None:
+                if requested_thinking:
+                    params["think"] = self.thinking_effort or True
+                    include_thinking = True
+                else:
+                    # Explicit opt-out MUST reach Ollama as `think: false` --
+                    # omitting the key is NOT equivalent to disabling thinking.
+                    # Ollama defaults thinking-capable models (e.g. qwen3) to
+                    # thinking ON, so a caller that asks for it off and is met
+                    # with silence pays full chain-of-thought latency anyway.
+                    params["think"] = False
             elif request.reasoning_effort is not None:  # pyright: ignore[reportAttributeAccessIssue]
                 # Ollama v0.9.0+ supports effort levels ("high", "medium", "low")
                 # via the `think` parameter — pass through directly.
@@ -1326,7 +1352,7 @@ class OllamaProvider:
 
         # --- streaming contract tracking (provider-streaming-contract.md) ---
         request_id = str(uuid4())
-        seq: dict[int, int] = {}          # block_index -> next sequence number
+        seq: dict[int, int] = {}  # block_index -> next sequence number
         block_index = 0
         current_block_type: str | None = None
         partial_emitted = False
@@ -1529,7 +1555,9 @@ class OllamaProvider:
                     # conditional here would be permanently dead. See
                     # tests/test_cache_read_tokens_not_fabricated.py.
                     _cost_usd = getattr(chat_response.usage, "cost_usd", None)
-                    event_usage["cost_usd"] = str(_cost_usd) if _cost_usd is not None else None
+                    event_usage["cost_usd"] = (
+                        str(_cost_usd) if _cost_usd is not None else None
+                    )
 
                 stream_response_payload: dict[str, Any] = {
                     "provider": "ollama",
@@ -2184,7 +2212,6 @@ class OllamaProvider:
         )
         usage = usage.model_copy(update={"cost_usd": cost})
         self._add_cost(cost)
-
 
         combined_text = "\n\n".join(text_accumulator).strip()
 
