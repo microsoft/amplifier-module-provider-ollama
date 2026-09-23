@@ -7,7 +7,7 @@ behavior, and Bearer header all key off the SAME source (host URL +
 optional api_key).
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -97,6 +97,7 @@ def test_client_property_passes_headers_to_async_client():
         mock_client_cls.assert_called_once_with(
             host="https://ollama.com",
             headers={"Authorization": "Bearer abc123"},
+            timeout=ANY,
         )
 
 
@@ -107,6 +108,7 @@ def test_client_property_passes_none_headers_for_local():
         mock_client_cls.assert_called_once_with(
             host="http://localhost:11434",
             headers=None,
+            timeout=ANY,
         )
 
 
