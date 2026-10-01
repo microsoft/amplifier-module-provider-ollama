@@ -184,7 +184,7 @@ def _coerce_int(value: Any, *, key: str, default: int) -> int:
         return default
 
 
-def _coerce_float(value: Any, *, key: str, default: float) -> float:
+def _coerce_float(value: Any, *, key: str, default: float | None) -> float | None:
     """Coerce a config value to float, warning and defaulting on failure."""
     if value is None:
         return default
@@ -293,7 +293,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
                     for Ollama Cloud (host on ollama.com), llama3.2:3b otherwise.
             - max_tokens: Maximum tokens (default: 4096)
             - temperature: Generation temperature (default: 0.7)
-            - timeout: Request timeout in seconds (default: 600)
+            - timeout: Optional request timeout in seconds (default: None)
             - auto_pull: Whether to auto-pull missing models (default: False;
                     silently ignored for cloud hosts since pull isn't supported).
             - api_key: Ollama Cloud API key (default: from OLLAMA_API_KEY env var).
@@ -419,9 +419,9 @@ class OllamaProvider:
         self.temperature = _coerce_float(
             self.config.get("temperature"), key="temperature", default=0.7
         )
-        # API timeout in seconds (default 10 min - local models need longer for prefill)
+        # Optional caller deadline; model prefill and thinking have no default cutoff.
         self.timeout = _coerce_float(
-            self.config.get("timeout"), key="timeout", default=600.0
+            self.config.get("timeout"), key="timeout", default=None
         )
         # NOTE: config wizards persist booleans as the strings "true"/"false".
         # bool("false") is True in Python -- _coerce_bool parses the string
@@ -514,7 +514,13 @@ class OllamaProvider:
         if self._client is None:
             if self.host is None:
                 raise ValueError("host must be provided for API calls")
-            self._client = AsyncClient(host=self.host, headers=self._headers)
+            from httpx import Timeout
+
+            self._client = AsyncClient(
+                host=self.host,
+                headers=self._headers,
+                timeout=Timeout(self.timeout, connect=5.0, pool=5.0),
+            )
         return self._client
 
     @property
@@ -537,7 +543,7 @@ class OllamaProvider:
                 "model": self.default_model,
                 "max_tokens": 4096,
                 "temperature": 0.7,
-                "timeout": 600.0,
+                "timeout": None,
                 "context_window": 128000,
                 "max_output_tokens": 64000,
             },

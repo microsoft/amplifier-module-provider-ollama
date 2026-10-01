@@ -30,7 +30,7 @@ deployment.
                                        # "llama3.2:3b" otherwise.
     "max_tokens": 4096,                # Maximum tokens to generate
     "temperature": 0.7,                # Generation temperature
-    "timeout": 600,                    # Request timeout (seconds; 10 min default)
+    "timeout": None,                   # Optional timeout (seconds; unlimited default)
     "auto_pull": False,                # Auto-pull missing models (local only;
                                        # silently ignored for Ollama Cloud).
 }
@@ -49,7 +49,7 @@ set it directly in `settings.yaml` / the provider's `config:` block.
 | `default_model` | string | host-derived | `gpt-oss:120b` (cloud) / `llama3.2:3b` (local) |
 | `max_tokens` | int | `4096` | Maps to `num_predict` |
 | `temperature` | float | `0.7` | |
-| `timeout` | float (seconds) | `600` | Request timeout |
+| `timeout` | float or null (seconds) | `null` | Optional request/read timeout |
 | `auto_pull` | bool | `False` | Auto-pull missing models (local only) |
 | `enable_thinking` | bool | `True` | Enable thinking/reasoning for supported models |
 | `thinking_effort` | string | `None` | `"low"`/`"medium"`/`"high"` |
@@ -309,3 +309,7 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Waiting for model work
+
+The default `timeout` is `null`: model work waits for completion, explicit cancellation, or a provider/transport error. Set a numeric `timeout` in seconds to opt into a deadline. Existing cleanup limits are unchanged.

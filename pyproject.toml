@@ -10,6 +10,7 @@ authors = [
 ]
 dependencies = [
     "ollama>=0.4.0",
+    "httpx>=0.27.0",
 ]
 
 [project.entry-points."amplifier.modules"]
