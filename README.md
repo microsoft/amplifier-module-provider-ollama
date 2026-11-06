@@ -14,6 +14,26 @@ Local LLM provider integration for Amplifier using Ollama.
 
 ## Configuration
 
+### Model listing
+
+`list_models(*, filters=None)` fetches the current complete `/api/tags` catalog.
+All installed model IDs are recommended by default, including custom names,
+size, quantization and tag variants. No vendor prefix or latest-size rule applies.
+The bound client and authentication are reused. Failure raises a typed sanitized
+error; it is not returned as a successful empty list.
+
+`config.model_filters` is an immutable snapshot of `include`, `exclude` and
+`hide_dated`. Explicit per-call mappings replace it: `{}` is unfiltered,
+`include: []` includes none, and exclude wins. Globs are case-insensitive and
+OS-independent without changing IDs. `hide_dated` only hides YYYY-MM-DD snapshots
+when the undated alias is selected. `get_model_list_info()` describes the v1
+selector schema with `source: provider-api`.
+
+`/api/tags` does not establish chat capabilities or token limits, so listing
+reports empty capabilities and zero (unknown) limits. Inference's existing
+`show`, context options, explicit model selection and optional pull behavior are
+unchanged; listing does not pull models.
+
 `host` is the **single source of truth** — local-vs-cloud is derived from
 the URL. Set it to `http://localhost:11434` for a local Ollama, or
 `https://ollama.com` for Ollama Cloud. The provider then automatically
