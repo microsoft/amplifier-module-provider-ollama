@@ -49,6 +49,8 @@ async def test_all_tags_filters_refresh_and_exact_inference():
                 "model": body["model"],
                 "message": {"role": "assistant", "content": "ok"},
                 "done": True,
+                "prompt_eval_count": 1,
+                "eval_count": 1,
             },
         )
 
