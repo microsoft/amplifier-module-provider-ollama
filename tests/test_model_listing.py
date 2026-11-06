@@ -76,7 +76,8 @@ async def test_all_tags_filters_refresh_and_exact_inference():
         await p.complete(
             ChatRequest(
                 model="hidden:Q8", messages=[Message(role="user", content="test")]
-            )
+            ),
+            model="hidden:Q8",
         )
         assert any(r.url.path == "/api/chat" for r in calls)
     finally:
