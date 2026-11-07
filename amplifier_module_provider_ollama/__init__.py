@@ -14,8 +14,10 @@ import time
 from decimal import Decimal
 from urllib.parse import urlparse
 from collections import defaultdict
+from collections.abc import Mapping
 from ._constants import CLOUD_DEFAULT_MODEL, LOCAL_DEFAULT_MODEL
 from ._cost import compute_cost
+from ._model_listing import ModelFilters, listing_info
 from typing import Any
 from uuid import uuid4
 
@@ -86,6 +88,7 @@ _KNOWN_CONFIG_KEYS = frozenset(
         "instance_id",
         "priority",
         "extra_request_params",
+        "model_filters",
     }
 )
 
@@ -398,6 +401,7 @@ class OllamaProvider:
         )
         self._client: AsyncClient | None = None  # Lazy init
         self.config = config or {}
+        self._model_filters = ModelFilters.parse(self.config.get("model_filters", {}))
         self.coordinator = coordinator
         self._add_cost = add_cost or (lambda cost: None)
 
@@ -648,35 +652,35 @@ class OllamaProvider:
 
         return caps
 
-    async def list_models(self) -> list[ModelInfo]:
-        """
-        List available models from local Ollama server.
+    def get_model_list_info(self) -> dict[str, Any]:
+        return listing_info("provider-api", self._model_filters)
 
-        The query is retried with the same shared retry_with_backoff()/
-        _retry_config machinery used by complete(), reusing this module's
-        own _translate_ollama_error() classification (retryable connection
-        errors, timeouts, and 5xx; non-retryable 401/403/404/400).
+    async def list_models(
+        self, *, filters: Mapping[str, object] | None = None
+    ) -> list[ModelInfo]:
+        """List all installed IDs, retaining tags/sizes/quantizations exactly.
 
-        Unlike complete(), list_models() never raises to the caller -- this
-        preserves the existing soft-failure contract (the setup wizard and
-        the model-role/glob resolver both treat [] as "no models available"
-        and degrade accordingly). Once retries are exhausted -- or
-        immediately, for a non-retryable error -- a WARNING is logged
-        naming the attempt count and the degraded fallback before falling
-        back to an empty list, so the degradation is loud in logs even
-        though it stays silent to the caller.
+        Explicit filters replace immutable defaults; {} is unfiltered.
+        The native /api/tags response is one complete list, not a paged API.
+        Failures raise typed errors, never an empty-success fallback.
         """
-        attempt_count = 0
+        policy = self._model_filters if filters is None else ModelFilters.parse(filters)
 
         async def _do_list_models():
-            nonlocal attempt_count
-            attempt_count += 1
             try:
-                return await self.client.list()
-            except LLMError:
-                raise  # Already translated, don't double-wrap
+                response = await self.client.list()
+                if not isinstance(response.models, list):
+                    raise ValueError("Ollama catalog requires a model list")
+                ids = [model.model for model in response.models]
+                if any(not isinstance(mid, str) or not mid.strip() for mid in ids):
+                    raise ValueError("Ollama catalog requires nonblank string IDs")
+                return ids
             except Exception as e:
-                raise _translate_ollama_error(e) from e
+                error = e if isinstance(e, LLMError) else _translate_ollama_error(e)
+                raise type(error)(
+                    "Ollama model listing failed", provider=self.name,
+                    retryable=error.retryable, status_code=getattr(error, "status_code", None),
+                ) from None
 
         # Callback for retry events -- signature matches amplifier-core's
         # retry_with_backoff on_retry contract: (attempt, delay, error)
@@ -694,45 +698,15 @@ class OllamaProvider:
                     },
                 )
 
-        try:
-            response = await retry_with_backoff(
-                _do_list_models, self._retry_config, on_retry=_on_retry
-            )
-        except LLMError as e:
-            logger.warning(
-                "[PROVIDER] list_models() failed after %d attempt(s) "
-                "(max_retries=%d): %s. Falling back to a DEGRADED EMPTY "
-                "model list -- model role/glob resolution may silently "
-                "resolve to no candidates.",
-                attempt_count,
-                self._retry_config.max_retries,
-                e,
-            )
-            return []
-        models = []
-        # response.models is a list of Model objects with .model attribute (not .name)
-        for model in response.models:
-            model_name = model.model  # Model objects use .model, not .name
-            if model_name:
-                # Extract details - model.details is a ModelDetails object
-                details = model.details
-                context_length = (
-                    getattr(details, "context_length", None) or DEFAULT_CONTEXT_LENGTH
-                )
-                models.append(
-                    ModelInfo(
-                        id=model_name,
-                        display_name=model_name,
-                        context_window=context_length,
-                        max_output_tokens=context_length,
-                        capabilities=self._detect_model_capabilities(model_name),
-                        defaults={
-                            "temperature": 0.7,
-                            "max_tokens": DEFAULT_CONTEXT_LENGTH,
-                        },
-                    )
-                )
-        return models
+        ids = await retry_with_backoff(
+            _do_list_models, self._retry_config, on_retry=_on_retry
+        )
+        # /api/tags does not establish context/output limits or chat capabilities.
+        # Keep inference's separate show/options behavior unchanged.
+        return [
+            ModelInfo(id=mid, display_name=mid, context_window=0, max_output_tokens=0)
+            for mid in policy.select(ids)
+        ]
 
     async def _check_connection(self) -> bool:
         """Verify Ollama server is reachable."""
