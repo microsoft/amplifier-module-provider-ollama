@@ -325,7 +325,9 @@ class TestReasoningEffort:
         )
         provider.client.chat = AsyncMock(return_value=mock_response())
 
-        request = simple_request(metadata={"stream": False})  # reasoning_effort defaults to None
+        request = simple_request(
+            metadata={"stream": False}
+        )  # reasoning_effort defaults to None
         await provider.complete(request, model="qwen3:8b")
 
         call_kwargs = provider.client.chat.call_args
@@ -404,3 +406,121 @@ class TestReasoningEffort:
             call_kwargs.kwargs.get("think") == "high"
             or call_kwargs[1].get("think") == "high"
         )
+
+
+# ── explicit enable_thinking=False must reach Ollama ──────────────────────
+#
+# Regression coverage for the bug where `request.enable_thinking = False` was
+# silently DROPPED instead of becoming `think: false`. The original code only
+# ever *set* the `think` key on paths that enable thinking; there was no
+# `else` branch for an explicit opt-out, so Ollama received no `think` key at
+# all and defaulted a thinking-capable model (e.g. qwen3) to thinking ON —
+# paying full chain-of-thought latency (measured ~6.4x) for a caller that
+# explicitly asked for it to be off.
+
+
+@pytest.mark.asyncio
+class TestExplicitThinkingDisable:
+    """Verify request.enable_thinking = False is transmitted as think: false."""
+
+    async def test_explicit_false_sends_think_false_non_streaming(
+        self, make_provider, simple_request, mock_response
+    ):
+        """enable_thinking=False must produce an explicit think: false, not omission."""
+        provider = make_provider(
+            default_model="qwen3:8b", enable_thinking=True, thinking_effort="high"
+        )
+        provider.client.chat = AsyncMock(return_value=mock_response())
+
+        request = simple_request(metadata={"stream": False})
+        request.enable_thinking = False  # type: ignore[attr-defined]
+        await provider.complete(request, model="qwen3:8b")
+
+        call_kwargs = provider.client.chat.call_args
+        params = call_kwargs.kwargs or call_kwargs[1]
+        assert "think" in params, (
+            "think key must be present (not omitted) when enable_thinking=False"
+        )
+        assert params["think"] is False
+
+    async def test_explicit_false_sends_think_false_streaming(
+        self, make_provider, simple_request
+    ):
+        """Same guarantee on the streaming call site."""
+        provider = make_provider(
+            default_model="qwen3:8b", enable_thinking=True, thinking_effort="high"
+        )
+
+        async def fake_stream():
+            yield {"message": {"content": "hi"}, "done": False}
+            yield {
+                "message": {"content": ""},
+                "done": True,
+                "prompt_eval_count": 5,
+                "eval_count": 2,
+                "model": "qwen3:8b",
+            }
+
+        provider.client.chat = AsyncMock(return_value=fake_stream())
+
+        request = simple_request(stream=True)
+        request.enable_thinking = False  # type: ignore[attr-defined]
+        await provider.complete(request, model="qwen3:8b")
+
+        call_kwargs = provider.client.chat.call_args
+        params = call_kwargs.kwargs or call_kwargs[1]
+        assert "think" in params, (
+            "think key must be present (not omitted) when enable_thinking=False "
+            "on the streaming path"
+        )
+        assert params["think"] is False
+
+    async def test_explicit_false_overrides_provider_config_and_reasoning_effort(
+        self, make_provider, simple_request, mock_response
+    ):
+        """Explicit False must win over both self.enable_thinking and reasoning_effort."""
+        provider = make_provider(
+            default_model="qwen3:8b", enable_thinking=True, thinking_effort="high"
+        )
+        provider.client.chat = AsyncMock(return_value=mock_response())
+
+        request = simple_request(reasoning_effort="medium", metadata={"stream": False})
+        request.enable_thinking = False  # type: ignore[attr-defined]
+        await provider.complete(request, model="qwen3:8b")
+
+        call_kwargs = provider.client.chat.call_args
+        params = call_kwargs.kwargs or call_kwargs[1]
+        assert params["think"] is False
+
+    async def test_explicit_true_still_enables_thinking(
+        self, make_provider, simple_request, mock_response
+    ):
+        """Regression guard: the enabled path must be byte-for-byte unchanged."""
+        provider = make_provider(
+            default_model="qwen3:8b", enable_thinking=False, thinking_effort="high"
+        )
+        provider.client.chat = AsyncMock(return_value=mock_response())
+
+        request = simple_request(metadata={"stream": False})
+        request.enable_thinking = True  # type: ignore[attr-defined]
+        await provider.complete(request, model="qwen3:8b")
+
+        call_kwargs = provider.client.chat.call_args
+        params = call_kwargs.kwargs or call_kwargs[1]
+        assert params["think"] == "high"
+
+    async def test_unset_enable_thinking_falls_through_to_config(
+        self, make_provider, simple_request, mock_response
+    ):
+        """Regression guard: not setting enable_thinking at all must be unaffected
+        (falls through to reasoning_effort, then provider config, exactly as before)."""
+        provider = make_provider(default_model="qwen3:8b", enable_thinking=False)
+        provider.client.chat = AsyncMock(return_value=mock_response())
+
+        request = simple_request(metadata={"stream": False})
+        # enable_thinking attribute intentionally not set on the request
+        await provider.complete(request, model="qwen3:8b")
+
+        call_kwargs = provider.client.chat.call_args
+        params = call_kwargs.kwargs or call_kwargs[1]
+        assert "think" not in params
