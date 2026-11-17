@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -42,6 +42,7 @@ name = "amplifier-module-provider-ollama"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "ollama" },
 ]
 
@@ -53,7 +54,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ollama", specifier = ">=0.4.0" }]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27.0" },
+    { name = "ollama", specifier = ">=0.5.2" },
+]
 
 [package.metadata.requires-dev]
 dev = [

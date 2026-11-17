@@ -79,7 +79,7 @@ set it directly in `settings.yaml` / the provider's `config:` block.
 | `logprobs`, `top_logprobs` | bool / int | unset | Requires Ollama >= 0.12.11 |
 | `max_retries`, `min_retry_delay`, `max_retry_delay`, `retry_jitter` | various | `3` / `1.0` / `60.0` / `True` | Client-side retry policy |
 | `use_streaming` | bool | `True` | Set `False` to force non-streaming completions |
-| `raw` | bool | `False` | Attach exact request params to the `llm:request` event |
+| `raw` | bool | `False` | Attach copied request params (image arrays redacted) to the `llm:request` event |
 | `extra_request_params` | dict | `{}` | Merged last into Ollama's `options` -- an escape hatch for any Ollama-native option not listed above (e.g. `mirostat`, `repeat_last_n`) |
 | `priority` | int | n/a | Read by the orchestrator's provider-selection logic, not by this module directly |
 
@@ -210,6 +210,46 @@ Any model available in Ollama:
 - And many more...
 
 See: https://ollama.ai/library
+
+## Image inputs (native `/api/chat`)
+
+Inline Core image blocks (`source.type: base64`, `source.data`) are forwarded as
+Ollama `images` on their original message, including tool results and assistant
+history. Tool results retain their place and matching native `tool_name`; they
+are never turned into synthetic user messages. The existing developer-to-wrapped-
+user conversion and system/developer hoisting are unchanged, but structured
+content is no longer discarded. Text and image order within their separate
+native arrays is retained; Ollama does not represent interleaved text/image blocks.
+
+Image bytes are not resized or image-decoded. Base64 is validated and passed as
+bytes so the SDK cannot mistake it for a local filename. Malformed/empty sources
+and URLs produce explicit `[Image unavailable: ...]` text in the original message.
+URLs and file paths are **not fetched**. A valid base64 envelope is not proof of
+a supported image format; the server/model still validates the image.
+
+Vision evidence comes only from the exact model's `/api/show` `capabilities`,
+reusing existing availability/context metadata calls (no extra serialization or
+readiness request). A cached list without `vision` produces an explicit unavailable
+notice instead of sending images. Missing metadata is **unknown**, not a guessed
+capability based on the model name: native images still go to the server. Plain
+text behavior, options, thinking selection and retry policy are unchanged.
+
+The SDK floor is 0.5.2 for native `tool_name`. The inspected SDKs through 0.6.1
+strip OpenAI-style `tool_call_id`/tool-call `id` from HTTP JSON; the provider retains
+IDs internally to associate the tool name, without claiming wire-ID preservation.
+Raw hook diagnostics are detached copies with image arrays redacted.
+
+**Qualification boundary:** offline tests exercise the real SDK serializer through
+`httpx.MockTransport`, not a running Ollama server or model. Native server image
+extraction is role-independent in sampled
+[v0.4.0](https://github.com/ollama/ollama/blob/v0.4.0/server/prompt.go) and
+[v0.12.11](https://github.com/ollama/ollama/blob/v0.12.11/server/prompt.go).
+Actual perception depends on the exact server, model, chat template/renderer,
+context truncation and image limits. In particular, some renderers omit
+first-system image markers or legacy tool-role content. Transport preservation
+for system/assistant/tool history is **not universal model-perception proof**.
+See the [native API](https://docs.ollama.com/api/chat) and
+[SDK message schema](https://github.com/ollama/ollama-python/blob/v0.5.2/ollama/_types.py).
 
 ## Thinking/Reasoning Support
 
