@@ -7,6 +7,8 @@ Integrates with local Ollama server for LLM completions.
 __amplifier_module_type__ = "provider"
 
 import asyncio
+import base64
+import binascii
 import difflib
 import logging
 import os
@@ -52,6 +54,21 @@ logger = logging.getLogger(__name__)
 
 # Unified default context length used when model metadata is unavailable
 DEFAULT_CONTEXT_LENGTH = 8192
+
+
+def _diagnostic_copy(value: Any) -> Any:
+    """Copy native payloads before hooks see them; never emit image bytes."""
+    if isinstance(value, dict):
+        return {
+            key: ["[REDACTED image]" for _ in item]
+            if key == "images" and isinstance(item, (list, tuple))
+            else _diagnostic_copy(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_diagnostic_copy(item) for item in value]
+    return value
+
 
 # Config keys this provider actively reads. Used by _warn_unknown_config_keys()
 # below to warn (never fail) on typos/removed keys. `priority` is read by the
@@ -110,8 +127,8 @@ _INERT_CONFIG_KEY_MESSAGES = {
     ),
     "raw_debug": (
         "Config key 'raw_debug' is no longer read by this provider. Use "
-        "'raw: true' instead -- it attaches the exact request params sent "
-        "to Ollama to the 'llm:request' event's 'raw' field."
+        "'raw: true' instead -- it attaches copied request params sent "
+        "to Ollama to the 'llm:request' event's 'raw' field (images redacted)."
     ),
 }
 
@@ -400,6 +417,7 @@ class OllamaProvider:
             {"Authorization": f"Bearer {api_key}"} if api_key else None
         )
         self._client: AsyncClient | None = None  # Lazy init
+        self._model_vision: dict[str, bool] = {}
         self.config = config or {}
         self._model_filters = ModelFilters.parse(self.config.get("model_filters", {}))
         self.coordinator = coordinator
@@ -726,7 +744,8 @@ class OllamaProvider:
         """
         try:
             # Try to get model info
-            await self.client.show(model)
+            info = await self.client.show(model)
+            self._record_image_capabilities(model, info)
             return True
         except ResponseError as e:
             if e.status_code == 404:
@@ -780,6 +799,7 @@ class OllamaProvider:
         try:
             # Query model info from ollama
             info = await self.client.show(model)
+            self._record_image_capabilities(model, info)
             # modelinfo (no underscore) contains context_length (e.g., "gptoss.context_length": 131072)
             model_info = (
                 getattr(info, "modelinfo", None)
@@ -934,26 +954,11 @@ class OllamaProvider:
             m for m in request.messages if m.role in ("user", "assistant", "tool")
         ]
 
-        # Build ollama messages list
-        ollama_messages = []
-
-        # Add system messages with native role (Ollama supports role: system)
-        for sys_msg in system_msgs:
-            content = sys_msg.content if isinstance(sys_msg.content, str) else ""
-            ollama_messages.append({"role": "system", "content": content})
-
-        # Convert developer messages to XML-wrapped user messages
-        for dev_msg in developer_msgs:
-            content = dev_msg.content if isinstance(dev_msg.content, str) else ""
-            wrapped = f"<context_file>\n{content}\n</context_file>"
-            ollama_messages.append({"role": "user", "content": wrapped})
-
-        # Convert conversation messages (synthetics are already in request.messages
-        # at the correct positions from _apply_jit_repair above)
-        conversation_msgs = self._convert_messages(
-            [m.model_dump() for m in conversation]
+        # Keep existing role hoisting and conversation order, but preserve
+        # structured system/developer content through the same converter.
+        ollama_messages = self._convert_messages(
+            [m.model_dump() for m in system_msgs + developer_msgs + conversation]
         )
-        ollama_messages.extend(conversation_msgs)
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
@@ -963,6 +968,7 @@ class OllamaProvider:
             await self._ensure_model_available(model)
 
         options = await self._build_options(model, request, kwargs)
+        self._apply_image_capabilities(model, ollama_messages)
 
         params: dict[str, Any] = {
             "model": model,
@@ -1022,7 +1028,7 @@ class OllamaProvider:
                 "message_count": len(ollama_messages),
             }
             if self.raw:
-                request_payload["raw"] = params
+                request_payload["raw"] = _diagnostic_copy(params)
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
@@ -1116,7 +1122,7 @@ class OllamaProvider:
                     "duration_ms": elapsed_ms,
                 }
                 if self.raw:
-                    response_payload["raw"] = response
+                    response_payload["raw"] = _diagnostic_copy(response)
                 await self.coordinator.hooks.emit("llm:response", response_payload)
 
             return chat_response
@@ -1210,24 +1216,9 @@ class OllamaProvider:
             m for m in request.messages if m.role in ("user", "assistant", "tool")
         ]
 
-        # Build ollama messages list
-        ollama_messages = []
-
-        for sys_msg in system_msgs:
-            content = sys_msg.content if isinstance(sys_msg.content, str) else ""
-            ollama_messages.append({"role": "system", "content": content})
-
-        for dev_msg in developer_msgs:
-            content = dev_msg.content if isinstance(dev_msg.content, str) else ""
-            wrapped = f"<context_file>\n{content}\n</context_file>"
-            ollama_messages.append({"role": "user", "content": wrapped})
-
-        # Convert conversation messages (synthetics are already in request.messages
-        # at the correct positions from _apply_jit_repair above)
-        conversation_msgs = self._convert_messages(
-            [m.model_dump() for m in conversation]
+        ollama_messages = self._convert_messages(
+            [m.model_dump() for m in system_msgs + developer_msgs + conversation]
         )
-        ollama_messages.extend(conversation_msgs)
 
         # Prepare request parameters
         model = kwargs.get("model", self.default_model)
@@ -1237,6 +1228,7 @@ class OllamaProvider:
             await self._ensure_model_available(model)
 
         options = await self._build_options(model, request, kwargs)
+        self._apply_image_capabilities(model, ollama_messages)
 
         params: dict[str, Any] = {
             "model": model,
@@ -1295,7 +1287,7 @@ class OllamaProvider:
                 "stream": True,
             }
             if self.raw:
-                stream_request_payload["raw"] = params
+                stream_request_payload["raw"] = _diagnostic_copy(params)
             await self.coordinator.hooks.emit("llm:request", stream_request_payload)
 
         start_time = time.time()
@@ -1362,6 +1354,11 @@ class OllamaProvider:
             # Mid-stream errors are NOT retried — they fall through to
             # the outer except blocks below.
             async for chunk in stream:
+                # The real SDK yields Pydantic ChatResponse objects, while
+                # offline callers may supply dictionaries. Normalize before
+                # retaining final_chunk (raw_response requires a dictionary).
+                if hasattr(chunk, "model_dump"):
+                    chunk = chunk.model_dump()
                 message = chunk.get("message", {})
                 thinking_delta = message.get("thinking") or ""
                 content_delta = message.get("content") or ""
@@ -1520,13 +1517,15 @@ class OllamaProvider:
                     "stream": True,
                 }
                 if self.raw:
-                    stream_response_payload["raw"] = {
-                        "content": accumulated_content,
-                        "thinking": accumulated_thinking
-                        if accumulated_thinking
-                        else None,
-                        "final_chunk": final_chunk,
-                    }
+                    stream_response_payload["raw"] = _diagnostic_copy(
+                        {
+                            "content": accumulated_content,
+                            "thinking": accumulated_thinking
+                            if accumulated_thinking
+                            else None,
+                            "final_chunk": final_chunk,
+                        }
+                    )
                 await self.coordinator.hooks.emit(
                     "llm:response", stream_response_payload
                 )
@@ -1921,18 +1920,48 @@ class OllamaProvider:
             ),
         }
 
+    def _record_image_capabilities(self, model: str, info: Any) -> None:
+        """Reuse existing show calls, never query or guess during serialization."""
+        capabilities = (
+            info.get("capabilities")
+            if isinstance(info, Mapping)
+            else getattr(info, "capabilities", None)
+        )
+        if isinstance(capabilities, list) and all(
+            isinstance(capability, str) for capability in capabilities
+        ):
+            self._model_vision[model] = "vision" in capabilities
+        else:
+            self._model_vision.pop(model, None)
+
+    def _apply_image_capabilities(
+        self, model: str, messages: list[dict[str, Any]]
+    ) -> None:
+        # Missing metadata on older servers/SDKs is UNKNOWN, not no-vision.
+        # Native bytes still go to the server, which decides model support.
+        if self._model_vision.get(model) is not False:
+            return
+        for message in messages:
+            if message.pop("images", None):
+                message["content"] += (
+                    "\n[Image unavailable: this model's Ollama capabilities "
+                    "do not include vision; image pixels were not sent.]"
+                )
+
     def _convert_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
-        Convert Amplifier message format to Ollama/OpenAI format.
+        Convert Amplifier message format to native Ollama chat messages.
 
         Handles the conversion of:
         - Tool calls in assistant messages (Amplifier format -> OpenAI format)
         - Tool result messages
         - Developer messages (converted to XML-wrapped user messages)
         - Regular user/assistant/system messages
-        - Structured content blocks (list of text/image blocks) -> plain string
+        - Structured content -> text plus native images on the SAME message.
+          Ollama's server/prompt.go processes images independently of role.
         """
         ollama_messages = []
+        tool_names: dict[str, str] = {}
 
         for msg in messages:
             role = msg.get("role")
@@ -1941,7 +1970,7 @@ class OllamaProvider:
             # Handle structured content (list of content blocks from Amplifier)
             # Convert to plain string for Ollama which expects string content
             # Extract base64 images for multimodal models (vision)
-            images: list[str] = []
+            images: list[bytes] = []
             if isinstance(content, list):
                 text_parts = []
                 for block in content:
@@ -1951,12 +1980,32 @@ class OllamaProvider:
                             text_parts.append(block["text"])
                         # Image content block: {"type": "image", "source": {"type": "base64", "data": "..."}}
                         elif block.get("type") == "image":
-                            source = block.get("source", {})
-                            if source.get("type") == "base64":
-                                images.append(source.get("data", ""))
-                            elif source.get("type") == "url":
+                            source = block.get("source")
+                            if not isinstance(source, dict):
                                 text_parts.append(
-                                    f"[Image URL: {source.get('url', '')}]"
+                                    "[Image unavailable: malformed image source.]"
+                                )
+                            elif source.get("type") == "base64":
+                                data = source.get("data")
+                                try:
+                                    if not isinstance(data, str) or not data:
+                                        raise ValueError("empty or non-string base64")
+                                    pixels = base64.b64decode(data, validate=True)
+                                    if not pixels:
+                                        raise ValueError("empty image bytes")
+                                except (ValueError, binascii.Error):
+                                    text_parts.append(
+                                        "[Image unavailable: invalid base64 image data.]"
+                                    )
+                                else:
+                                    # SDK strings may be local filenames. Bytes
+                                    # avoid file reads and preserve original
+                                    # bytes without resizing or image decoding.
+                                    images.append(pixels)
+                            else:
+                                text_parts.append(
+                                    "[Image unavailable: Ollama requires inline "
+                                    "base64 image data; URLs/files are not fetched.]"
                                 )
                         # ToolCallContent, ThinkingContent, etc. - handled by role-specific logic
                     elif isinstance(block, str):
@@ -1969,17 +2018,30 @@ class OllamaProvider:
                 ollama_messages.append({"role": "user", "content": wrapped})
 
             elif role == "assistant":
-                # Check for tool_calls in Amplifier format
-                if "tool_calls" in msg and msg["tool_calls"]:
+                # Core histories may store ToolCall fields OR ToolCallBlocks
+                # in content. Both must preserve the parent of a tool image.
+                calls = msg.get("tool_calls") or [
+                    {
+                        "id": block.get("id"),
+                        "name": block.get("name"),
+                        "arguments": block.get("input", {}),
+                    }
+                    for block in msg.get("content", [])
+                    if isinstance(block, dict) and block.get("type") == "tool_call"
+                ]
+                if calls:
                     # Convert Amplifier tool_calls to OpenAI format
                     ollama_tool_calls = []
-                    for tc in msg["tool_calls"]:
+                    for tc in calls:
+                        tool_name = tc.get("tool") or tc.get("name", "")
+                        if tc.get("id"):
+                            tool_names[tc["id"]] = tool_name
                         ollama_tool_calls.append(
                             {
                                 "id": tc.get("id", ""),
                                 "type": "function",  # OpenAI requires this
                                 "function": {
-                                    "name": tc.get("tool", ""),
+                                    "name": tool_name,
                                     "arguments": tc.get("arguments", {}),
                                 },
                             }
@@ -2005,13 +2067,24 @@ class OllamaProvider:
                         "tool_call_id": msg.get("tool_call_id", ""),
                     }
                 )
+                # Native Ollama uses tool_name and ordering, not OpenAI IDs.
+                # Keep the original ID at this boundary and resolve only its
+                # matching call if the result has no explicit name.
+                tool_name = (
+                    msg.get("name")
+                    or msg.get("tool_name")
+                    or tool_names.get(msg.get("tool_call_id", ""))
+                )
+                if tool_name:
+                    ollama_messages[-1]["tool_name"] = tool_name
 
             else:
                 # User, system, etc. - build message with optional images
                 out_msg: dict[str, Any] = {"role": role, "content": content}
-                if images:
-                    out_msg["images"] = images
                 ollama_messages.append(out_msg)
+
+            if images:
+                ollama_messages[-1]["images"] = images
 
         return ollama_messages
 
