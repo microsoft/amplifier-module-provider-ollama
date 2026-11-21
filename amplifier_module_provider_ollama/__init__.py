@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from decimal import Decimal
+from functools import cached_property
 from urllib.parse import urlparse
 from collections import defaultdict
 from collections.abc import Mapping
@@ -56,18 +57,43 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONTEXT_LENGTH = 8192
 
 
-def _diagnostic_copy(value: Any) -> Any:
-    """Copy native payloads before hooks see them; never emit image bytes."""
-    if isinstance(value, dict):
-        return {
-            key: ["[REDACTED image]" for _ in item]
-            if key == "images" and isinstance(item, (list, tuple))
-            else _diagnostic_copy(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_diagnostic_copy(item) for item in value]
-    return value
+class _ImageDiagnostics:
+    """Request-local view for raw events and errors. Ollama sends images as base64."""
+
+    def __init__(self, messages):
+        self.images = {image for msg in messages for image in msg.get("images", ())}
+
+    @cached_property
+    def patterns(self):
+        encoded = {base64.b64encode(image).decode("ascii") for image in self.images if image}
+        return sorted(encoded | {value.replace("/", r"\/") for value in encoded}, key=len, reverse=True)
+
+    def copy(self, value):
+        if isinstance(value, dict):
+            return {
+                key: ["[REDACTED image]" for _ in item]
+                if key == "images" and isinstance(item, (list, tuple))
+                else self.copy(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self.copy(item) for item in value]
+        if isinstance(value, str):
+            for pattern in self.patterns:
+                value = value.replace(pattern, "[REDACTED image]")
+        return value
+
+    def chat_error(self, original, timeout):
+        error = original if isinstance(original, LLMError) else _translate_ollama_error(original)
+        if isinstance(original, TimeoutError) and not str(error):
+            error.args = (f"Request timed out after {timeout}s",)
+        if self.images:
+            # SDK causes can retain the whole HTTP request as well as the error.
+            error.args = tuple(self.copy(arg) for arg in error.args)
+            error.__cause__ = error.__context__ = None
+        elif error is not original:
+            error.__cause__ = original
+        return error
 
 
 # Config keys this provider actively reads. Used by _warn_unknown_config_keys()
@@ -253,14 +279,8 @@ class OllamaChatResponse(ChatResponse):
 def _translate_ollama_error(e: Exception) -> LLMError:  # pyright: ignore[reportReturnType]
     """Translate native Ollama/connection errors to kernel LLM error types.
 
-    Called inside _do_complete() / _do_stream_connect() / _do_list_models()
-    so that retry_with_backoff sees LLMError subclasses and can check
-    .retryable to decide whether to retry.
-    5xx errors become ProviderUnavailableError(retryable=True), while
-    4xx errors become non-retryable errors that raise immediately.
-
-    The returned exception should be raised with ``raise ... from e`` to
-    preserve the original ``__cause__``.
+    Retry policy uses the returned subtype, status code and retryable flag.
+    Callers that expose image requests detach the SDK exception from public errors.
     """
     if isinstance(e, ResponseError):
         status = getattr(e, "status_code", None)
@@ -903,6 +923,34 @@ class OllamaProvider:
 
         return options
 
+    async def _chat(self, params: dict[str, Any], diagnostics: _ImageDiagnostics):
+        """Translate and redact before Core observes an error or retries the call."""
+        async def _do_complete():
+            try:
+                return await asyncio.wait_for(
+                    self.client.chat(**params), timeout=self.timeout
+                )
+            except Exception as exc:
+                error = diagnostics.chat_error(exc, self.timeout)
+            # Raise outside the handler so Python cannot reattach the SDK context.
+            raise error
+
+        async def _on_retry(attempt: int, delay: float, error: LLMError) -> None:
+            if self.coordinator and hasattr(self.coordinator, "hooks"):
+                await self.coordinator.hooks.emit(
+                    "provider:retry",
+                    {
+                        "provider": self.name,
+                        "attempt": attempt,
+                        "max_retries": self._retry_config.max_retries,
+                        "delay": delay,
+                        "error_type": type(error).__name__,
+                        "error_message": str(error),
+                    },
+                )
+
+        return await retry_with_backoff(_do_complete, self._retry_config, on_retry=_on_retry)
+
     async def _complete_chat_request(
         self, request: ChatRequest, **kwargs
     ) -> OllamaChatResponse:
@@ -1020,6 +1068,8 @@ class OllamaProvider:
                 params["think"] = self.thinking_effort or True
                 include_thinking = True
 
+        diagnostics = _ImageDiagnostics(ollama_messages)
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             request_payload: dict[str, Any] = {
@@ -1028,57 +1078,14 @@ class OllamaProvider:
                 "message_count": len(ollama_messages),
             }
             if self.raw:
-                request_payload["raw"] = _diagnostic_copy(params)
+                request_payload["raw"] = diagnostics.copy(params)
             await self.coordinator.hooks.emit("llm:request", request_payload)
 
         start_time = time.time()
 
-        # Inner function: wraps the Ollama API call with error translation
-        # so that retry_with_backoff sees LLMError subclasses and can check
-        # .retryable to decide whether to retry (e.g. 5xx → retried, 400 → not).
-        async def _do_complete():
-            try:
-                return await asyncio.wait_for(
-                    self.client.chat(**params), timeout=self.timeout
-                )
-            except ResponseError as e:
-                raise _translate_ollama_error(e) from e
-            except (asyncio.TimeoutError, TimeoutError) as e:
-                raise LLMTimeoutError(
-                    str(e) or f"Request timed out after {self.timeout}s",
-                    provider="ollama",
-                    retryable=True,
-                ) from e
-            except (ConnectionError, OSError) as e:
-                raise ProviderUnavailableError(
-                    str(e), provider="ollama", retryable=True
-                ) from e
-            except LLMError:
-                raise
-            except Exception as e:
-                raise _translate_ollama_error(e) from e
-
-        # Callback for retry events — signature matches amplifier-core's
-        # retry_with_backoff on_retry contract: (attempt, delay, error)
-        async def _on_retry(attempt: int, delay: float, error: LLMError) -> None:
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "provider:retry",
-                    {
-                        "provider": self.name,
-                        "attempt": attempt,
-                        "max_retries": self._retry_config.max_retries,
-                        "delay": delay,
-                        "error_type": type(error).__name__,
-                        "error_message": str(error),
-                    },
-                )
-
         # Call Ollama API with retry_with_backoff for transient errors
         try:
-            raw_response = await retry_with_backoff(
-                _do_complete, self._retry_config, on_retry=_on_retry
-            )
+            raw_response = await self._chat(params, diagnostics)
             # Convert Pydantic model to dict for consistent access
             response = (
                 raw_response.model_dump()
@@ -1122,14 +1129,15 @@ class OllamaProvider:
                     "duration_ms": elapsed_ms,
                 }
                 if self.raw:
-                    response_payload["raw"] = _diagnostic_copy(response)
+                    response_payload["raw"] = diagnostics.copy(response)
                 await self.coordinator.hooks.emit("llm:response", response_payload)
 
             return chat_response
 
-        except LLMError as e:
+        except Exception as exc:
+            error = diagnostics.chat_error(exc, self.timeout)
             elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] Ollama API error: {e}")
+            logger.error(f"[PROVIDER] Ollama API error: {error}")
 
             # Emit error event
             if self.coordinator and hasattr(self.coordinator, "hooks"):
@@ -1139,31 +1147,13 @@ class OllamaProvider:
                         "provider": "ollama",
                         "model": model,
                         "status": "timeout"
-                        if isinstance(e, LLMTimeoutError)
+                        if isinstance(error, LLMTimeoutError)
                         else "error",
                         "duration_ms": elapsed_ms,
-                        "error": str(e),
+                        "error": str(error),
                     },
                 )
-            raise
-
-        except Exception as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] Ollama API error: {e}")
-
-            # Emit error event
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "ollama",
-                        "model": model,
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": str(e),
-                    },
-                )
-            raise _translate_ollama_error(e) from e
+        raise error
 
     async def _complete_streaming(
         self, request: ChatRequest, **kwargs
@@ -1278,6 +1268,8 @@ class OllamaProvider:
                 params["think"] = self.thinking_effort or True
                 include_thinking = True
 
+        diagnostics = _ImageDiagnostics(ollama_messages)
+
         # Emit llm:request event
         if self.coordinator and hasattr(self.coordinator, "hooks"):
             stream_request_payload: dict[str, Any] = {
@@ -1287,7 +1279,7 @@ class OllamaProvider:
                 "stream": True,
             }
             if self.raw:
-                stream_request_payload["raw"] = _diagnostic_copy(params)
+                stream_request_payload["raw"] = diagnostics.copy(params)
             await self.coordinator.hooks.emit("llm:request", stream_request_payload)
 
         start_time = time.time()
@@ -1304,52 +1296,9 @@ class OllamaProvider:
         partial_emitted = False
         hooks_available = bool(self.coordinator and hasattr(self.coordinator, "hooks"))
 
-        # Inner function: wraps the initial stream connection with error
-        # translation so that retry_with_backoff sees LLMError subclasses and
-        # can check .retryable to decide whether to retry.
-        async def _do_stream_connect():
-            try:
-                return await asyncio.wait_for(
-                    self.client.chat(**params), timeout=self.timeout
-                )
-            except ResponseError as e:
-                raise _translate_ollama_error(e) from e
-            except (asyncio.TimeoutError, TimeoutError) as e:
-                raise LLMTimeoutError(
-                    str(e) or f"Request timed out after {self.timeout}s",
-                    provider="ollama",
-                    retryable=True,
-                ) from e
-            except (ConnectionError, OSError) as e:
-                raise ProviderUnavailableError(
-                    str(e), provider="ollama", retryable=True
-                ) from e
-            except LLMError:
-                raise
-            except Exception as e:
-                raise _translate_ollama_error(e) from e
-
-        # Callback for retry events — signature matches amplifier-core's
-        # retry_with_backoff on_retry contract: (attempt, delay, error)
-        async def _on_retry(attempt: int, delay: float, error: LLMError) -> None:
-            if self.coordinator and hasattr(self.coordinator, "hooks"):
-                await self.coordinator.hooks.emit(
-                    "provider:retry",
-                    {
-                        "provider": self.name,
-                        "attempt": attempt,
-                        "max_retries": self._retry_config.max_retries,
-                        "delay": delay,
-                        "error_type": type(error).__name__,
-                        "error_message": str(error),
-                    },
-                )
-
         try:
             # Retry covers the initial stream connection only.
-            stream = await retry_with_backoff(
-                _do_stream_connect, self._retry_config, on_retry=_on_retry
-            )
+            stream = await self._chat(params, diagnostics)
 
             # Mid-stream errors are NOT retried — they fall through to
             # the outer except blocks below.
@@ -1517,7 +1466,7 @@ class OllamaProvider:
                     "stream": True,
                 }
                 if self.raw:
-                    stream_response_payload["raw"] = _diagnostic_copy(
+                    stream_response_payload["raw"] = diagnostics.copy(
                         {
                             "content": accumulated_content,
                             "thinking": accumulated_thinking
@@ -1532,9 +1481,10 @@ class OllamaProvider:
 
             return chat_response
 
-        except LLMError as e:
+        except Exception as exc:
+            error = diagnostics.chat_error(exc, self.timeout)
             elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] Streaming error: {e}")
+            logger.error(f"[PROVIDER] Streaming error: {error}")
 
             if hooks_available:
                 await self.coordinator.hooks.emit(
@@ -1543,10 +1493,10 @@ class OllamaProvider:
                         "provider": "ollama",
                         "model": model,
                         "status": "timeout"
-                        if isinstance(e, LLMTimeoutError)
+                        if isinstance(error, LLMTimeoutError)
                         else "error",
                         "duration_ms": elapsed_ms,
-                        "error": str(e),
+                        "error": str(error),
                         "stream": True,
                     },
                 )
@@ -1555,36 +1505,10 @@ class OllamaProvider:
                         "llm:stream_aborted",
                         {
                             "request_id": request_id,
-                            "error": {"type": type(e).__name__, "msg": str(e)},
+                            "error": {"type": type(exc).__name__, "msg": str(error)},
                         },
                     )
-            raise
-
-        except Exception as e:
-            elapsed_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"[PROVIDER] Streaming error: {e}")
-
-            if hooks_available:
-                await self.coordinator.hooks.emit(
-                    "llm:response",
-                    {
-                        "provider": "ollama",
-                        "model": model,
-                        "status": "error",
-                        "duration_ms": elapsed_ms,
-                        "error": str(e),
-                        "stream": True,
-                    },
-                )
-                if partial_emitted:
-                    await self.coordinator.hooks.emit(
-                        "llm:stream_aborted",
-                        {
-                            "request_id": request_id,
-                            "error": {"type": type(e).__name__, "msg": str(e)},
-                        },
-                    )
-            raise _translate_ollama_error(e) from e
+        raise error
 
     def _build_streaming_response(
         self,

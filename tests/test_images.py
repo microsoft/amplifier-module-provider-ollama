@@ -356,3 +356,62 @@ async def test_real_sdk_multichunk_preserves_thinking_tools_and_no_replay(
     assert len(requests) == 1
     assert requests[0]["messages"][-1]["images"] == [PNG]
     assert request.model_dump() == before
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_echoed_pixels_private_in_retry_and_terminal_errors(make_provider, caplog, raw, stream):
+    import traceback
+    from amplifier_core import InvalidRequestError
+
+    attempts = []
+
+    def handler(request):
+        assert json.loads(request.content)["messages"][-1]["images"] == [PNG]
+        attempts.append(request.url.path)
+        # Ollama streaming opens the HTTP connection during iteration.
+        status = 503 if not stream and len(attempts) == 1 else 400
+        return httpx.Response(status, json={"error": f"image validation failed for {PNG}"})
+
+    instance = make_provider(raw=raw, num_ctx=4096, use_streaming=stream, max_retries=1,
+                             min_retry_delay=0.001)
+    instance._client = ollama.AsyncClient(
+        host="http://ollama-fixture.invalid", transport=httpx.MockTransport(handler)
+    )
+    req = ChatRequest(messages=history())
+    before = req.model_dump()
+    try:
+        with pytest.raises(InvalidRequestError) as caught:
+            await instance.complete(req)
+    finally:
+        await instance.client._client.aclose()
+    events = instance.coordinator.hooks.events
+    assert len(attempts) == (1 if stream else 2)
+    assert sum(name == "provider:retry" for name, _ in events) == (0 if stream else 1)
+    assert caught.value.status_code == 400 and not caught.value.retryable
+    assert "image validation failed" in str(caught.value)
+    assert PNG not in "".join(traceback.format_exception(caught.value)) + caplog.text + repr(events)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert req.model_dump() == before
+
+
+def test_image_encoded_once_per_request_across_long_diagnostics(monkeypatch):
+    from amplifier_module_provider_ollama import _ImageDiagnostics
+
+    count = 0
+    encode = base64.b64encode
+
+    def counting(data):
+        nonlocal count
+        count += 1
+        return encode(data)
+
+    monkeypatch.setattr(base64, "b64encode", counting)
+    messages = [{"content": f"text {index}"} for index in range(800)]
+    messages.extend([{"images": [PIXELS]}, {"images": [PIXELS]}])
+    diagnostic = _ImageDiagnostics(messages)
+    diagnostic.copy(messages)
+    assert PNG not in diagnostic.copy(f"echo {PNG}")
+    assert "[REDACTED image]" == diagnostic.copy(PNG.replace("/", r"\/"))
+    assert count == 1
+    assert _ImageDiagnostics([]).copy(PNG) == PNG
